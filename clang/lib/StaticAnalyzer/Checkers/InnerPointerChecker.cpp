@@ -116,17 +116,15 @@ public:
 bool InnerPointerChecker::isInvalidatingMemberFunction(
         const CallEvent &Call) const {
   if (const auto *MemOpCall = dyn_cast<CXXMemberOperatorCall>(&Call)) {
-    OverloadedOperatorKind Opc = MemOpCall->getOriginExpr()->getOperator();
-    if (Opc == OO_Equal || Opc == OO_PlusEqual)
-      return true;
-    return false;
+    OverloadedOperatorKind Opc = MemOpCall->getOverloadedOperator();
+    return Opc == OO_Equal || Opc == OO_PlusEqual;
   }
-  return (isa<CXXDestructorCall>(Call) || Call.isCalled(AppendFn) ||
-          Call.isCalled(AssignFn) || Call.isCalled(ClearFn) ||
-          Call.isCalled(EraseFn) || Call.isCalled(InsertFn) ||
-          Call.isCalled(PopBackFn) || Call.isCalled(PushBackFn) ||
-          Call.isCalled(ReplaceFn) || Call.isCalled(ReserveFn) ||
-          Call.isCalled(ResizeFn) || Call.isCalled(ShrinkToFitFn) ||
+  return (isa<CXXDestructorCall>(Call) || Call.isCalled(AppendFn)      ||
+          Call.isCalled(AssignFn)      || Call.isCalled(ClearFn)       ||
+          Call.isCalled(EraseFn)       || Call.isCalled(InsertFn)      ||
+          Call.isCalled(PopBackFn)     || Call.isCalled(PushBackFn)    ||
+          Call.isCalled(ReplaceFn)     || Call.isCalled(ReserveFn)     ||
+          Call.isCalled(ResizeFn)      || Call.isCalled(ShrinkToFitFn) ||
           Call.isCalled(SwapFn));
 }
 
