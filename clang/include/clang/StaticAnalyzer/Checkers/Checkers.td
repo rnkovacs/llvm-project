@@ -557,6 +557,11 @@ def InnerPointerChecker : Checker<"InnerPointer">,
   Dependencies<[DynamicMemoryModeling]>,
   Documentation<NotDocumented>;
 
+def StringModeling : Checker<"StringModeling">,
+  HelpText<"Model std::string operations that return an inner pointer">,
+  Dependencies<[DynamicMemoryModeling]>,
+  Documentation<NotDocumented>;
+
 def NewDeleteChecker : Checker<"NewDelete">,
   HelpText<"Check for double-free and use-after-free problems. Traces memory "
            "managed by new/delete.">,
