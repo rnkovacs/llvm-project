@@ -551,15 +551,15 @@ def StdCLibraryFunctionArgsChecker : Checker<"StdCLibraryFunctionArgs">,
 
 let ParentPackage = Cplusplus in {
 
+def StringModeling : Checker<"StringModeling">,
+  HelpText<"Model std::string operations that return an inner pointer">,
+  Documentation<NotDocumented>,
+  Hidden;
+
 def InnerPointerChecker : Checker<"InnerPointer">,
   HelpText<"Check for inner pointers of C++ containers used after "
            "re/deallocation">,
-  Dependencies<[DynamicMemoryModeling]>,
-  Documentation<NotDocumented>;
-
-def StringModeling : Checker<"StringModeling">,
-  HelpText<"Model std::string operations that return an inner pointer">,
-  Dependencies<[DynamicMemoryModeling]>,
+  Dependencies<[DynamicMemoryModeling, StringModeling]>,
   Documentation<NotDocumented>;
 
 def NewDeleteChecker : Checker<"NewDelete">,

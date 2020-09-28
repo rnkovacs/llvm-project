@@ -13,8 +13,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "AllocationState.h"
-#include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
+#include "InnerPtr.h"
 #include "InterCheckerAPI.h"
+
+#include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/CommonBugCategories.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
@@ -25,9 +27,7 @@ using namespace clang;
 using namespace ento;
 
 // Associate container objects with a set of raw pointer symbols.
-REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(PtrSet, SymbolRef)
-REGISTER_MAP_WITH_PROGRAMSTATE(RawPtrMap, const MemRegion *, PtrSet)
-
+REGISTER_MAP_WITH_PROGRAMSTATE(RawPtrMap, const MemRegion *, SymbolRef)
 
 namespace {
 
@@ -40,10 +40,10 @@ class InnerPointerChecker
 
 public:
   class InnerPointerBRVisitor : public BugReporterVisitor {
-    SymbolRef PtrToBuf;
+    SymbolRef Sym;
 
   public:
-    InnerPointerBRVisitor(SymbolRef Sym) : PtrToBuf(Sym) {}
+    InnerPointerBRVisitor(SymbolRef Sym) : Sym(Sym) {}
 
     static void *getTag() {
       static int Tag = 0;
@@ -63,7 +63,7 @@ public:
     bool isSymbolTracked(ProgramStateRef State, SymbolRef Sym) {
       RawPtrMapTy Map = State->get<RawPtrMap>();
       for (const auto &Entry : Map) {
-        if (Entry.second.contains(Sym))
+        if (Entry.second == Sym)
           return true;
       }
       return false;
@@ -92,9 +92,9 @@ public:
 
   /// Mark pointer symbols associated with the given memory region released
   /// in the program state.
-  void markPtrSymbolsReleased(const CallEvent &Call, ProgramStateRef State,
-                              const MemRegion *ObjRegion,
-                              CheckerContext &C) const;
+  void markPtrSymbolReleased(const CallEvent &Call, ProgramStateRef State,
+                             const MemRegion *ObjRegion,
+                             CheckerContext &C) const;
 
   /// Standard library functions that take a non-const `basic_string` argument by
   /// reference may invalidate its inner pointers. Check for these cases and
@@ -128,19 +128,15 @@ bool InnerPointerChecker::isInvalidatingMemberFunction(
           Call.isCalled(SwapFn));
 }
 
-void InnerPointerChecker::markPtrSymbolsReleased(const CallEvent &Call,
+void InnerPointerChecker::markPtrSymbolReleased(const CallEvent &Call,
                                                  ProgramStateRef State,
-                                                 const MemRegion *MR,
+                                                 const MemRegion *String,
                                                  CheckerContext &C) const {
-  if (const PtrSet *PS = State->get<RawPtrMap>(MR)) {
-    const Expr *Origin = Call.getOriginExpr();
-    for (const auto Symbol : *PS) {
-      // NOTE: `Origin` may be null, and will be stored so in the symbol's
-      // `RefState` in MallocChecker's `RegionState` program state map.
-      State = allocation_state::markReleased(State, Symbol, Origin);
-    }
-    State = State->remove<RawPtrMap>(MR);
-    C.addTransition(State);
+  if (const SymbolRef *Sym = State->get<RawPtrMap>(String)) {
+    const auto *CallExpr = Call.getOriginExpr();
+    // CallExpr may be null and will be stored so in MallocChecker's GDM.
+    State = allocation_state::markReleased(State, *Sym, CallExpr);
+    C.addTransition(State->remove<RawPtrMap>(String));
     return;
   }
 }
@@ -170,7 +166,7 @@ void InnerPointerChecker::checkFunctionArguments(const CallEvent &Call,
       if (!ArgRegion)
         continue;
 
-      markPtrSymbolsReleased(Call, State, ArgRegion, C);
+      markPtrSymbolReleased(Call, State, ArgRegion, C);
     }
   }
 }
@@ -202,25 +198,22 @@ void InnerPointerChecker::checkPostCall(const CallEvent &Call,
 
     if (Call.isCalled(CStrFn) || Call.isCalled(DataFn)) {
       SVal RawPtr = Call.getReturnValue();
-      if (SymbolRef Sym = RawPtr.getAsSymbol(/*IncludeBaseRegions=*/true)) {
-        // Start tracking this raw pointer by adding it to the set of symbols
-        // associated with this container object in the program state map.
+      SymbolRef Sym = RawPtr.getAsSymbol(/*IncludeBaseRegions=*/true);
+      assert(Sym && "Inner pointer is not a symbol");
 
-        PtrSet::Factory &F = State->getStateManager().get_context<PtrSet>();
-        const PtrSet *SetPtr = State->get<RawPtrMap>(ObjRegion);
-        PtrSet Set = SetPtr ? *SetPtr : F.getEmptySet();
-        assert(C.wasInlined || !Set.contains(Sym));
-        Set = F.add(Set, Sym);
-
-        State = State->set<RawPtrMap>(ObjRegion, Set);
-        C.addTransition(State);
+      if (const SymbolRef *PrevSym = State->get<RawPtrMap>(ObjRegion)) {
+        assert(Sym == *PrevSym && "Inner pointer symbol mismatch in RawPtrMap");
+        return;
       }
+
+      State = State->set<RawPtrMap>(ObjRegion, Sym);
+      C.addTransition(State);
       return;
     }
 
     // Check [string.require] / second point.
     if (isInvalidatingMemberFunction(Call)) {
-      markPtrSymbolsReleased(Call, State, ObjRegion, C);
+      markPtrSymbolReleased(Call, State, ObjRegion, C);
       return;
     }
   }
@@ -232,40 +225,37 @@ void InnerPointerChecker::checkPostCall(const CallEvent &Call,
 void InnerPointerChecker::checkDeadSymbols(SymbolReaper &SymReaper,
                                            CheckerContext &C) const {
   ProgramStateRef State = C.getState();
-  PtrSet::Factory &F = State->getStateManager().get_context<PtrSet>();
-  RawPtrMapTy RPM = State->get<RawPtrMap>();
-  for (const auto &Entry : RPM) {
+  RawPtrMapTy PtrMap = State->get<RawPtrMap>();
+
+  for (const auto &Entry : PtrMap) {
     if (!SymReaper.isLiveRegion(Entry.first)) {
       // Due to incomplete destructor support, some dead regions might
       // remain in the program state map. Clean them up.
       State = State->remove<RawPtrMap>(Entry.first);
+      continue;
     }
-    if (const PtrSet *OldSet = State->get<RawPtrMap>(Entry.first)) {
-      PtrSet CleanedUpSet = *OldSet;
-      for (const auto Symbol : Entry.second) {
-        if (!SymReaper.isLive(Symbol))
-          CleanedUpSet = F.remove(CleanedUpSet, Symbol);
-      }
-      State = CleanedUpSet.isEmpty()
-                  ? State->remove<RawPtrMap>(Entry.first)
-                  : State->set<RawPtrMap>(Entry.first, CleanedUpSet);
-    }
+
+    const SymbolRef *Sym = State->get<RawPtrMap>(Entry.first);
+    if (!SymReaper.isLive(*Sym))
+      State = State->remove<RawPtrMap>(Entry.first);
   }
+
   C.addTransition(State);
 }
 
 namespace clang {
 namespace ento {
+
 namespace allocation_state {
 
 std::unique_ptr<BugReporterVisitor> getInnerPointerBRVisitor(SymbolRef Sym) {
   return std::make_unique<InnerPointerChecker::InnerPointerBRVisitor>(Sym);
 }
 
-const MemRegion *getContainerObjRegion(ProgramStateRef State, SymbolRef Sym) {
+const MemRegion *getContainerRegion(ProgramStateRef State, SymbolRef Sym) {
   RawPtrMapTy Map = State->get<RawPtrMap>();
   for (const auto &Entry : Map) {
-    if (Entry.second.contains(Sym)) {
+    if (Entry.second == Sym) {
       return Entry.first;
     }
   }
@@ -273,13 +263,28 @@ const MemRegion *getContainerObjRegion(ProgramStateRef State, SymbolRef Sym) {
 }
 
 } // end namespace allocation_state
+
+namespace innerptr {
+
+bool hasSymbolFor(ProgramStateRef State, const MemRegion *String) {
+  return State->get<RawPtrMap>(String);
+}
+
+SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String) {
+  const SymbolRef *Ptr = State->get<RawPtrMap>(String);
+  assert(Ptr && "Region not present in RawPtrMap");
+  return *Ptr;
+}
+
+} // end namespace innerptr
+
 } // end namespace ento
 } // end namespace clang
 
 PathDiagnosticPieceRef InnerPointerChecker::InnerPointerBRVisitor::VisitNode(
     const ExplodedNode *N, BugReporterContext &BRC, PathSensitiveBugReport &) {
-  if (!isSymbolTracked(N->getState(), PtrToBuf) ||
-      isSymbolTracked(N->getFirstPred()->getState(), PtrToBuf))
+  if (!isSymbolTracked(N->getState(), Sym) ||
+      isSymbolTracked(N->getFirstPred()->getState(), Sym))
     return nullptr;
 
   const Stmt *S = N->getStmtForDiagnostics();
@@ -287,7 +292,7 @@ PathDiagnosticPieceRef InnerPointerChecker::InnerPointerBRVisitor::VisitNode(
     return nullptr;
 
   const MemRegion *ObjRegion =
-      allocation_state::getContainerObjRegion(N->getState(), PtrToBuf);
+      allocation_state::getContainerRegion(N->getState(), Sym);
   const auto *TypedRegion = cast<TypedValueRegion>(ObjRegion);
   QualType ObjTy = TypedRegion->getValueType();
 
