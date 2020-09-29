@@ -54,7 +54,7 @@ static QualType getInnerPointerType(const CallEvent &Call, CheckerContext &C) {
     return {};
 
   auto TemplateArgs = TSD->getTemplateArgs().asArray();
-  assert(TemplateArgs.size() >= 1 && "Invalid number of template parameters");
+  assert(TemplateArgs.size() >= 1 && "Invalid number of template arguments");
 
   auto InnerValueType = TemplateArgs[0].getAsType();
   return C.getASTContext().getPointerType(InnerValueType.getCanonicalType());
