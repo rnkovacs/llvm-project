@@ -13,6 +13,7 @@
 #ifndef LLVM_CLANG_LIB_STATICANALYZER_CHECKERS_INNERPTR_H
 #define LLVM_CLANG_LIB_STATICANALYZER_CHECKERS_INNERPTR_H
 
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
@@ -23,6 +24,9 @@ namespace innerptr {
 
 bool      hasSymbolFor(ProgramStateRef State, const MemRegion *String);
 SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String);
+void      markViewsReleased(ProgramStateRef State, const MemRegion *String,
+                            CheckerContext &C);
+
 
 } // namespace innerptr
 } // namespace ento

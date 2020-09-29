@@ -132,6 +132,8 @@ void InnerPointerChecker::markPtrSymbolReleased(const CallEvent &Call,
                                                  ProgramStateRef State,
                                                  const MemRegion *String,
                                                  CheckerContext &C) const {
+  innerptr::markViewsReleased(State, String, C);
+
   if (const SymbolRef *Sym = State->get<RawPtrMap>(String)) {
     const auto *CallExpr = Call.getOriginExpr();
     // CallExpr may be null and will be stored so in MallocChecker's GDM.

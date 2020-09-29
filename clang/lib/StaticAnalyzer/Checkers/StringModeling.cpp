@@ -25,9 +25,13 @@
 using namespace clang;
 using namespace ento;
 
+REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(ViewSet, SymbolRef)
+REGISTER_MAP_WITH_PROGRAMSTATE(ViewMap, const MemRegion *, ViewSet)
+
 namespace {
 
-class StringModeling : public Checker<eval::Call> {
+class StringModeling
+  : public Checker<eval::Call, check::PostCall, check::DeadSymbols> {
   CallDescription CStrFn, DataFn;
 
 public:
@@ -36,6 +40,8 @@ public:
       DataFn({"std", "basic_string", "data"}) {}
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
 };
 
 } // end of anonymous namespace
@@ -91,8 +97,101 @@ bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
   return true;
 }
 
+static bool isStringViewConversion(const CallEvent &Call) {
+  const auto *CD = dyn_cast<CXXConversionDecl>(Call.getDecl());
+  if (!CD || !CD->getParent())
+    return false;
+
+  const auto *RD = CD->getParent();
+  if (!RD || !RD->isInStdNamespace() || RD->getName() != "basic_string")
+    return false;
+
+  const auto *II = CD->getConversionType().getBaseTypeIdentifier();
+  if (!II || II->getName() != "basic_string_view")
+    return false;
+
+  return true;
+}
+
+void
+StringModeling::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  if (!isStringViewConversion(Call))
+    return;
+
+  SymbolRef View = Call.getReturnValue().getAsSymbol();
+  if (!View)
+    return;
+
+  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+  if (!ICall)
+    return;
+
+  const MemRegion *String = ICall->getCXXThisVal().getAsRegion();
+  if (!String)
+    return;
+
+  ProgramStateRef State = C.getState();
+
+  ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
+  const ViewSet *OldSet = State->get<ViewMap>(String);
+  ViewSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+  // FIXME: what does this ensure again?
+  assert(C.wasInlined || !NewSet.contains(View));
+  NewSet = F.add(NewSet, View);
+
+  C.addTransition(State->set<ViewMap>(String, NewSet));
+}
+
+void StringModeling::checkDeadSymbols(SymbolReaper &SymReaper,
+                                      CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
+  ViewMapTy Map = State->get<ViewMap>();
+
+  for (const auto &Entry : Map) {
+    if (!SymReaper.isLiveRegion(Entry.first)) {
+      // Due to incomplete destructor support, some dead regions might
+      // remain in the program state map. Clean them up.
+      State = State->remove<ViewMap>(Entry.first);
+    }
+    if (const ViewSet *OldSet = State->get<ViewMap>(Entry.first)) {
+      ViewSet CleanedUpSet = *OldSet;
+      for (const auto Symbol : Entry.second) {
+        if (!SymReaper.isLive(Symbol))
+          CleanedUpSet = F.remove(CleanedUpSet, Symbol);
+      }
+      State = CleanedUpSet.isEmpty()
+                  ? State->remove<ViewMap>(Entry.first)
+                  : State->set<ViewMap>(Entry.first, CleanedUpSet);
+    }
+  }
+
+  C.addTransition(State);
+}
+
+namespace clang {
+namespace ento {
+namespace innerptr {
+
+void markViewsReleased(ProgramStateRef State, const MemRegion *String,
+                       CheckerContext &C) {
+  if (const ViewSet *Set = State->get<ViewMap>(String)) {
+    for (const SymbolRef View : *Set) {
+      // FIXME: send View to StringViewChecker as released
+    }
+    C.addTransition(State->remove<ViewMap>(String));
+    return;
+  }
+}
+
+} // end namespace innerptr
+} // end namespace ento
+} // end namespace clang
+
 void ento::registerStringModeling(CheckerManager &Mgr) {
-  // FIXME: InnerPtrChecker is a dependency!
+  // FIXME: InnerPtrChecker is a dependency?
   Mgr.registerChecker<StringModeling>();
 }
 
