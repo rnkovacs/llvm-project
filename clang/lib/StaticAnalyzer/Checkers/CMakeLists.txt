@@ -105,6 +105,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   STLAlgorithmModeling.cpp
   StreamChecker.cpp
   StringModeling.cpp
+  StringViewChecker.cpp
   Taint.cpp
   TaintTesterChecker.cpp
   TestAfterDivZeroChecker.cpp
