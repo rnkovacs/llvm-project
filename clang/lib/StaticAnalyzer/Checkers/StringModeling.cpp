@@ -13,6 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "AllocationState.h"
 #include "InnerPtr.h"
 
 #include "clang/StaticAnalyzer/Checkers/BuiltinCheckerRegistration.h"
@@ -32,12 +33,12 @@ namespace {
 
 class StringModeling
   : public Checker<eval::Call, check::PostCall, check::DeadSymbols> {
-  CallDescription CStrFn, DataFn;
+  CallDescription StringCStr, StringData;
 
 public:
   StringModeling()
-    : CStrFn({"std", "basic_string", "c_str"}),
-      DataFn({"std", "basic_string", "data"}) {}
+    : StringCStr({"std", "basic_string", "c_str"}),
+      StringData({"std", "basic_string", "data"}) {}
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
@@ -67,11 +68,10 @@ static QualType getInnerPointerType(const CallEvent &Call, CheckerContext &C) {
 }
 
 bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
-  if (!Call.isCalled(CStrFn) && !Call.isCalled(DataFn))
+  if (!Call.isCalled(StringCStr) && !Call.isCalled(StringData))
     return false;
 
   const auto *MemCall = dyn_cast<CXXMemberCall>(&Call);
-  assert(MemCall && "Call is not MemberCall after c_str/data");
   const MemRegion *String = MemCall->getCXXThisVal().getAsRegion();
   if (!String)
     return false;
@@ -179,7 +179,7 @@ void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C) {
   if (const ViewSet *Set = State->get<ViewMap>(String)) {
     for (const SymbolRef View : *Set) {
-      // FIXME: send View to StringViewChecker as released
+      State = allocation_state::markViewReleased(State, View);
     }
     C.addTransition(State->remove<ViewMap>(String));
     return;
