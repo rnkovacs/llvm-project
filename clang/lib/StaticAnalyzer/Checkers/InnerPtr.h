@@ -22,11 +22,12 @@ namespace clang {
 namespace ento {
 namespace innerptr {
 
-bool      hasSymbolFor(ProgramStateRef State, const MemRegion *String);
+bool hasSymbolFor(ProgramStateRef State, const MemRegion *String);
 SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String);
-void      markViewsReleased(ProgramStateRef State, const MemRegion *String,
-                            CheckerContext &C);
+void setSymbolFor(CheckerContext &C, const MemRegion *String, SymbolRef Sym);
 
+void markViewsReleased(ProgramStateRef State, const MemRegion *String,
+                       CheckerContext &C);
 
 } // namespace innerptr
 } // namespace ento

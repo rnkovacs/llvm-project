@@ -198,21 +198,6 @@ void InnerPointerChecker::checkPostCall(const CallEvent &Call,
     if (!ObjRegion)
       return;
 
-    if (Call.isCalled(CStrFn) || Call.isCalled(DataFn)) {
-      SVal RawPtr = Call.getReturnValue();
-      SymbolRef Sym = RawPtr.getAsSymbol(/*IncludeBaseRegions=*/true);
-      assert(Sym && "Inner pointer is not a symbol");
-
-      if (const SymbolRef *PrevSym = State->get<RawPtrMap>(ObjRegion)) {
-        assert(Sym == *PrevSym && "Inner pointer symbol mismatch in RawPtrMap");
-        return;
-      }
-
-      State = State->set<RawPtrMap>(ObjRegion, Sym);
-      C.addTransition(State);
-      return;
-    }
-
     // Check [string.require] / second point.
     if (isInvalidatingMemberFunction(Call)) {
       markPtrSymbolReleased(Call, State, ObjRegion, C);
@@ -276,6 +261,12 @@ SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String) {
   const SymbolRef *Ptr = State->get<RawPtrMap>(String);
   assert(Ptr && "Region not present in RawPtrMap");
   return *Ptr;
+}
+
+void setSymbolFor(CheckerContext &C, const MemRegion *String, SymbolRef Sym) {
+  ProgramStateRef State = C.getState();
+  assert(!State->contains<RawPtrMap>(String));
+  C.addTransition(State->set<RawPtrMap>(String, Sym));
 }
 
 } // end namespace innerptr

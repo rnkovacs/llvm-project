@@ -33,12 +33,13 @@ namespace {
 
 class StringModeling
   : public Checker<eval::Call, check::PostCall, check::DeadSymbols> {
-  CallDescription StringCStr, StringData;
+  CallDescription StringCStr, StringData, ViewData;
 
 public:
   StringModeling()
     : StringCStr({"std", "basic_string", "c_str"}),
-      StringData({"std", "basic_string", "data"}) {}
+      StringData({"std", "basic_string", "data"}),
+      ViewData({"std", "basic_string_view", "data"}) {}
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
@@ -68,33 +69,38 @@ static QualType getInnerPointerType(const CallEvent &Call, CheckerContext &C) {
 }
 
 bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
-  if (!Call.isCalled(StringCStr) && !Call.isCalled(StringData))
-    return false;
+  if (Call.isCalled(StringCStr) || Call.isCalled(StringData)) {
+    const auto *MemCall = dyn_cast<CXXMemberCall>(&Call);
+    const MemRegion *String = MemCall->getCXXThisVal().getAsRegion();
+    if (!String)
+      return false;
 
-  const auto *MemCall = dyn_cast<CXXMemberCall>(&Call);
-  const MemRegion *String = MemCall->getCXXThisVal().getAsRegion();
-  if (!String)
-    return false;
+    ProgramStateRef State = C.getState();
+    const LocationContext *LC = C.getLocationContext();
+    SValBuilder &SVB = C.getSValBuilder();
 
-  ProgramStateRef State = C.getState();
-  const LocationContext *LC = C.getLocationContext();
-  SValBuilder &SVB = C.getSValBuilder();
+    const auto *CallExpr = Call.getOriginExpr();
+    SVal Ptr;
 
-  const auto *CallExpr = Call.getOriginExpr();
-  SVal Ptr;
+    if (innerptr::hasSymbolFor(State, String)) {
+      SymbolRef Sym = innerptr::getSymbolFor(State, String);
+      MemRegionManager &MemMgr = SVB.getRegionManager();
+      Ptr = loc::MemRegionVal(MemMgr.getSymbolicRegion(Sym));
+      C.addTransition(State->BindExpr(CallExpr, LC, Ptr));
+      return true;
+    }
 
-  if (innerptr::hasSymbolFor(State, String)) {
-    SymbolRef Sym = innerptr::getSymbolFor(State, String);
-    MemRegionManager &MemMgr = SVB.getRegionManager();
-    Ptr = loc::MemRegionVal(MemMgr.getSymbolicRegion(Sym));
+    QualType InnerPtrTy = getInnerPointerType(Call, C);
+    Ptr = SVB.conjureSymbolVal(CallExpr, LC, InnerPtrTy, C.blockCount());
+    innerptr::setSymbolFor(C, String, Ptr.getAsSymbol());
     C.addTransition(State->BindExpr(CallExpr, LC, Ptr));
     return true;
   }
 
-  QualType InnerPtrTy = getInnerPointerType(Call, C);
-  Ptr = SVB.conjureSymbolVal(CallExpr, LC, InnerPtrTy, C.blockCount());
-  C.addTransition(State->BindExpr(CallExpr, LC, Ptr));
-  return true;
+  if (Call.isCalled(ViewData)) {
+  }
+
+  return false;
 }
 
 static bool isStringViewConversion(const CallEvent &Call) {
