@@ -96,8 +96,8 @@ public:
                              const MemRegion *ObjRegion,
                              CheckerContext &C) const;
 
-  /// Standard library functions that take a non-const `basic_string` argument by
-  /// reference may invalidate its inner pointers. Check for these cases and
+  /// Standard library functions that take a non-const `basic_string` argument
+  /// by reference may invalidate its inner pointers. Check for these cases and
   /// mark the pointers released.
   void checkFunctionArguments(const CallEvent &Call, ProgramStateRef State,
                               CheckerContext &C) const;
@@ -109,36 +109,54 @@ public:
 
   /// Clean up the program state map.
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
+
+  void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
+                  const char *Sep) const;
 };
 
 } // end anonymous namespace
 
+void InnerPointerChecker::printState(raw_ostream &Out, ProgramStateRef State,
+                                     const char *NL, const char *Sep) const {
+  RawPtrMapTy RPM = State->get<RawPtrMap>();
+  if (!RPM.isEmpty()) {
+    Out << Sep << "Inner pointers:" << NL;
+    for (const auto &Entry : RPM) {
+      Entry.first->dumpToStream(Out);
+      Out << " : ";
+      Entry.second->dumpToStream(Out);
+      Out << NL;
+    }
+  }
+}
+
 bool InnerPointerChecker::isInvalidatingMemberFunction(
-        const CallEvent &Call) const {
+    const CallEvent &Call) const {
   if (const auto *MemOpCall = dyn_cast<CXXMemberOperatorCall>(&Call)) {
     OverloadedOperatorKind Opc = MemOpCall->getOverloadedOperator();
     return Opc == OO_Equal || Opc == OO_PlusEqual;
   }
-  return (isa<CXXDestructorCall>(Call) || Call.isCalled(AppendFn)      ||
-          Call.isCalled(AssignFn)      || Call.isCalled(ClearFn)       ||
-          Call.isCalled(EraseFn)       || Call.isCalled(InsertFn)      ||
-          Call.isCalled(PopBackFn)     || Call.isCalled(PushBackFn)    ||
-          Call.isCalled(ReplaceFn)     || Call.isCalled(ReserveFn)     ||
-          Call.isCalled(ResizeFn)      || Call.isCalled(ShrinkToFitFn) ||
+  return (isa<CXXDestructorCall>(Call) || Call.isCalled(AppendFn) ||
+          Call.isCalled(AssignFn) || Call.isCalled(ClearFn) ||
+          Call.isCalled(EraseFn) || Call.isCalled(InsertFn) ||
+          Call.isCalled(PopBackFn) || Call.isCalled(PushBackFn) ||
+          Call.isCalled(ReplaceFn) || Call.isCalled(ReserveFn) ||
+          Call.isCalled(ResizeFn) || Call.isCalled(ShrinkToFitFn) ||
           Call.isCalled(SwapFn));
 }
 
 void InnerPointerChecker::markPtrSymbolReleased(const CallEvent &Call,
-                                                 ProgramStateRef State,
-                                                 const MemRegion *String,
-                                                 CheckerContext &C) const {
-  innerptr::markViewsReleased(State, String, C);
+                                                ProgramStateRef State,
+                                                const MemRegion *String,
+                                                CheckerContext &C) const {
+  // innerptr::markViewsReleased(State, String, C);
 
   if (const SymbolRef *Sym = State->get<RawPtrMap>(String)) {
     const auto *CallExpr = Call.getOriginExpr();
     // CallExpr may be null and will be stored so in MallocChecker's GDM.
     State = allocation_state::markReleased(State, *Sym, CallExpr);
-    C.addTransition(State->remove<RawPtrMap>(String));
+    C.addTransition(State);
+    //C.addTransition(State->remove<RawPtrMap>(String));
     return;
   }
 }
@@ -160,7 +178,7 @@ void InnerPointerChecker::checkFunctionArguments(const CallEvent &Call,
       // In case of member operator calls, `this` is counted as an
       // argument but not as a parameter.
       bool isaMemberOpCall = isa<CXXMemberOperatorCall>(FC);
-      unsigned ArgI = isaMemberOpCall ? I+1 : I;
+      unsigned ArgI = isaMemberOpCall ? I + 1 : I;
 
       SVal Arg = FC->getArgSVal(ArgI);
       const auto *ArgRegion =
@@ -211,6 +229,7 @@ void InnerPointerChecker::checkPostCall(const CallEvent &Call,
 
 void InnerPointerChecker::checkDeadSymbols(SymbolReaper &SymReaper,
                                            CheckerContext &C) const {
+  /*
   ProgramStateRef State = C.getState();
   RawPtrMapTy PtrMap = State->get<RawPtrMap>();
 
@@ -223,11 +242,17 @@ void InnerPointerChecker::checkDeadSymbols(SymbolReaper &SymReaper,
     }
 
     const SymbolRef *Sym = State->get<RawPtrMap>(Entry.first);
-    if (!SymReaper.isLive(*Sym))
+    if (!SymReaper.isLive(*Sym)) {
+      llvm::errs() << "Removing:\n";
+      Entry.first->dump();
+      llvm::errs() << "\n";
+      (*Sym)->dump();
+      llvm::errs() << "\nfrom RawPtrMap\n\n";
       State = State->remove<RawPtrMap>(Entry.first);
+    }
   }
 
-  C.addTransition(State);
+  C.addTransition(State);*/
 }
 
 namespace clang {
@@ -263,10 +288,11 @@ SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String) {
   return *Ptr;
 }
 
-void setSymbolFor(CheckerContext &C, const MemRegion *String, SymbolRef Sym) {
+ProgramStateRef setSymbolFor(CheckerContext &C, const MemRegion *String,
+                             SymbolRef Sym) {
   ProgramStateRef State = C.getState();
   assert(!State->contains<RawPtrMap>(String));
-  C.addTransition(State->set<RawPtrMap>(String, Sym));
+  return State->set<RawPtrMap>(String, Sym);
 }
 
 } // end namespace innerptr

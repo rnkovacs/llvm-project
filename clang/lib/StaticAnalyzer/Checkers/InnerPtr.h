@@ -24,7 +24,8 @@ namespace innerptr {
 
 bool hasSymbolFor(ProgramStateRef State, const MemRegion *String);
 SymbolRef getSymbolFor(ProgramStateRef State, const MemRegion *String);
-void setSymbolFor(CheckerContext &C, const MemRegion *String, SymbolRef Sym);
+ProgramStateRef setSymbolFor(CheckerContext &C, const MemRegion *String,
+                             SymbolRef Sym);
 
 void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C);
