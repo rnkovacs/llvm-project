@@ -28,11 +28,11 @@ REGISTER_SET_WITH_PROGRAMSTATE(ReleasedViews, SymbolRef)
 namespace {
 
 class StringViewChecker
-    : public Checker<check::Location, check::PreCall,
+    : public Checker<check::Location, check::PostCall,
                      check::PreStmt<ReturnStmt>, check::EndFunction,
                      check::PointerEscape, check::DeadSymbols> {
 
-  void reportUseAfterFree(CheckerContext &C) const;
+  void reportUseAfterFree(CheckerContext &C, SymbolRef Sym) const;
   void checkEscapeOnReturn(const ReturnStmt *S, CheckerContext &C) const;
 
 public:
@@ -42,35 +42,50 @@ public:
                      CheckerContext &C) const;
   void checkPreStmt(const ReturnStmt *S, CheckerContext &C) const;
   void checkEndFunction(const ReturnStmt *S, CheckerContext &C) const;
-  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
   ProgramStateRef checkPointerEscape(ProgramStateRef State,
                                      const InvalidatedSymbols &Escaped,
                                      const CallEvent *Call,
                                      PointerEscapeKind Kind) const;
-
+  void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
+                  const char *Sep) const;
 };
 
 } // end of anonymous namespace
 
-void StringViewChecker::checkLocation(SVal V, bool isLoad, const Stmt *S,
-                                      CheckerContext &C) const {
-  if (auto Sym = V.getAs<nonloc::SymbolVal>()) {
-    if (C.getState()->contains<ReleasedViews>(Sym->getSymbol()))
-      reportUseAfterFree(C);
+void StringViewChecker::printState(raw_ostream &Out, ProgramStateRef State,
+                                   const char *NL, const char *Sep) const {
+  const ReleasedViewsTy &Set = State->get<ReleasedViews>();
+  if (!Set.isEmpty()) {
+    Out << Sep << "Released views:" << NL;
+    for (const SymbolRef Sym : Set) {
+      Sym->dumpToStream(Out);
+      Out << ", ";
+    }
   }
 }
 
-void StringViewChecker::reportUseAfterFree(CheckerContext &C) const {
+void StringViewChecker::checkLocation(SVal V, bool isLoad, const Stmt *S,
+                                      CheckerContext &C) const {
+  if (auto Sym = V.getAs<nonloc::SymbolVal>()) {
+    SymbolRef View = Sym->getSymbol();
+    if (C.getState()->contains<ReleasedViews>(View))
+      reportUseAfterFree(C, View);
+  }
+}
+
+void StringViewChecker::reportUseAfterFree(CheckerContext &C, SymbolRef Sym) const {
   ExplodedNode *N = C.generateErrorNode();
   if (!N)
     return;
 
   llvm::SmallString<128> Str;
   llvm::raw_svector_ostream OS(Str);
-  OS << "Error";
+  OS << "Inner pointer of container used after re/deallocation";
 
   auto R = std::make_unique<PathSensitiveBugReport>(DanglingViewBugTy, OS.str(), N);
+  R->addVisitor(innerptr::getStringModelingBRVisitor(Sym));
   C.emitReport(std::move(R));
 }
 
@@ -96,15 +111,35 @@ void StringViewChecker::checkEscapeOnReturn(const ReturnStmt *S,
   SVal RetVal = C.getSVal(RetExpr);
 
   if (auto Sym = RetVal.getAs<nonloc::SymbolVal>()) {
-    if (C.getState()->contains<ReleasedViews>(Sym->getSymbol())) {
-      reportUseAfterFree(C);
+    SymbolRef View = Sym->getSymbol();
+    if (C.getState()->contains<ReleasedViews>(View)) {
+      reportUseAfterFree(C, View);
     }
   }
 }
 
-void StringViewChecker::checkPreCall(const CallEvent &Call,
-                                     CheckerContext &C) const {
+void StringViewChecker::checkPostCall(const CallEvent &Call,
+                                      CheckerContext &C) const {
+  if (const auto *MemOp = dyn_cast<CXXMemberOperatorCall>(&Call)) {
+    const auto *MD = dyn_cast<CXXMethodDecl>(Call.getDecl());
+    if (!MD || MD->getNameAsString() != "operator[]")
+      return;
 
+    // if this is a [] call, and the this symbol is in the set, bug
+    const MemRegion *ViewRegion = MemOp->getCXXThisVal().getAsRegion();
+    if (!ViewRegion)
+      return;
+
+    ProgramStateRef State = C.getState();
+    StoreManager &StoreMgr = C.getStoreManager();
+    auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
+    if (!ViewVal)
+      return;
+
+    SymbolRef View = ViewVal.getValue().getAsSymbol(true);
+    if (State->contains<ReleasedViews>(View))
+      reportUseAfterFree(C, View);
+  }
 }
 
 void StringViewChecker::checkDeadSymbols(SymbolReaper &SymReaper,

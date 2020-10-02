@@ -37,6 +37,37 @@ class StringModeling
   CallDescription StringCStr, StringData, ViewData;
 
 public:
+  class StringModelingBRVisitor : public BugReporterVisitor {
+    SymbolRef Sym;
+
+  public:
+    StringModelingBRVisitor(SymbolRef Sym) : Sym(Sym) {}
+
+    static void *getTag() {
+      static int Tag = 0;
+      return &Tag;
+    }
+
+    void Profile(llvm::FoldingSetNodeID &ID) const override {
+      ID.AddPointer(getTag());
+    }
+
+    virtual PathDiagnosticPieceRef
+    VisitNode(const ExplodedNode *N, BugReporterContext &BRC,
+              PathSensitiveBugReport &BR) override;
+
+    bool isSymbolTracked(ProgramStateRef State, SymbolRef Sym) {
+      ViewMapTy Map = State->get<ViewMap>();
+      for (const auto &Entry : Map) {
+        for (const SymbolRef View : Entry.second) {
+          if (View == Sym)
+            return true;
+        }
+      }
+      return false;
+    }
+  };
+
   StringModeling()
       : StringCStr({"std", "basic_string", "c_str"}),
         StringData({"std", "basic_string", "data"}),
@@ -301,9 +332,41 @@ void StringModeling::checkDeadSymbols(SymbolReaper &SymReaper,
   C.addTransition(State);
 }
 
+PathDiagnosticPieceRef StringModeling::StringModelingBRVisitor::VisitNode(
+    const ExplodedNode *N, BugReporterContext &BRC, PathSensitiveBugReport &) {
+  if (!isSymbolTracked(N->getState(), Sym) ||
+      isSymbolTracked(N->getFirstPred()->getState(), Sym))
+    return nullptr;
+
+  const Stmt *S = N->getStmtForDiagnostics();
+
+  if (!S)
+    return nullptr;
+
+  const MemRegion *String = getStringFor(N->getState(), Sym);
+  if (!String)
+    return nullptr;
+
+  const auto *TypedRegion = cast<TypedValueRegion>(String);
+  QualType ObjTy = TypedRegion->getValueType();
+
+  SmallString<256> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  OS << "Pointer to inner buffer of '" << ObjTy.getAsString()
+     << "' obtained here";
+ 
+  PathDiagnosticLocation Pos(S, BRC.getSourceManager(),
+                             N->getLocationContext());
+  return std::make_shared<PathDiagnosticEventPiece>(Pos, OS.str(), true);
+}
+
 namespace clang {
 namespace ento {
 namespace innerptr {
+
+std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(SymbolRef Sym) {
+  return std::make_unique<StringModeling::StringModelingBRVisitor>(Sym);
+}
 
 void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C) {

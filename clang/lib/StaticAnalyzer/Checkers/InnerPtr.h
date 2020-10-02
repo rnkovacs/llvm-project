@@ -30,6 +30,8 @@ ProgramStateRef setSymbolFor(CheckerContext &C, const MemRegion *String,
 void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C);
 
+std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(SymbolRef Sym);
+
 } // namespace innerptr
 } // namespace ento
 } // namespace clang
