@@ -36,7 +36,28 @@ class StringViewChecker
   void checkEscapeOnReturn(const ReturnStmt *S, CheckerContext &C) const;
 
 public:
-  BugType DanglingViewBugTy{this, "Dangling string view", "C++ std::string_view"};
+  class StringViewBRVisitor : public BugReporterVisitor {
+    SymbolRef Sym;
+
+  public:
+    StringViewBRVisitor(SymbolRef Sym) : Sym(Sym) {}
+
+    static void *getTag() {
+      static int Tag = 0;
+      return &Tag;
+    }
+
+    void Profile(llvm::FoldingSetNodeID &ID) const override {
+      ID.AddPointer(getTag());
+    }
+
+    virtual PathDiagnosticPieceRef
+    VisitNode(const ExplodedNode *N, BugReporterContext &BRC,
+              PathSensitiveBugReport &BR) override;
+  };
+
+  BugType DanglingViewBugTy{this, "Dangling string view",
+                            "C++ std::string_view"};
 
   void checkLocation(SVal V, bool isLoad, const Stmt *S,
                      CheckerContext &C) const;
@@ -49,7 +70,7 @@ public:
                                      const CallEvent *Call,
                                      PointerEscapeKind Kind) const;
   void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
-                  const char *Sep) const;
+                  const char *Sep) const override;
 };
 
 } // end of anonymous namespace
@@ -73,20 +94,6 @@ void StringViewChecker::checkLocation(SVal V, bool isLoad, const Stmt *S,
     if (C.getState()->contains<ReleasedViews>(View))
       reportUseAfterFree(C, View);
   }
-}
-
-void StringViewChecker::reportUseAfterFree(CheckerContext &C, SymbolRef Sym) const {
-  ExplodedNode *N = C.generateErrorNode();
-  if (!N)
-    return;
-
-  llvm::SmallString<128> Str;
-  llvm::raw_svector_ostream OS(Str);
-  OS << "Inner pointer of container used after re/deallocation";
-
-  auto R = std::make_unique<PathSensitiveBugReport>(DanglingViewBugTy, OS.str(), N);
-  R->addVisitor(innerptr::getStringModelingBRVisitor(Sym));
-  C.emitReport(std::move(R));
 }
 
 void StringViewChecker::checkPreStmt(const ReturnStmt *S,
@@ -155,11 +162,88 @@ void StringViewChecker::checkDeadSymbols(SymbolReaper &SymReaper,
   C.addTransition(State);
 }
 
-
 ProgramStateRef StringViewChecker::checkPointerEscape(
     ProgramStateRef State, const InvalidatedSymbols &Escaped,
     const CallEvent *Call, PointerEscapeKind Kind) const {
   return State;
+}
+
+void StringViewChecker::reportUseAfterFree(CheckerContext &C,
+                                           SymbolRef Sym) const {
+  ExplodedNode *N = C.generateErrorNode();
+  if (!N)
+    return;
+
+  llvm::SmallString<128> Str;
+  llvm::raw_svector_ostream OS(Str);
+  OS << "Inner pointer of container used after re/deallocation";
+
+  auto R =
+      std::make_unique<PathSensitiveBugReport>(DanglingViewBugTy, OS.str(), N);
+  R->addVisitor(std::make_unique<StringViewBRVisitor>(Sym));
+  R->addVisitor(innerptr::getStringModelingBRVisitor(Sym));
+  C.emitReport(std::move(R));
+}
+
+PathDiagnosticPieceRef
+StringViewChecker::StringViewBRVisitor::VisitNode(const ExplodedNode *N,
+                                                  BugReporterContext &BRC,
+                                                  PathSensitiveBugReport &BR) {
+  ProgramStateRef State = N->getState();
+  ProgramStateRef PrevState = N->getFirstPred()->getState();
+
+  if (!State->contains<ReleasedViews>(Sym) ||
+      PrevState->contains<ReleasedViews>(Sym))
+    return nullptr;
+
+  const Stmt *S = N->getStmtForDiagnostics();
+  const LocationContext *LC = N->getLocationContext();
+
+  const MemRegion *String = innerptr::getStringFor(PrevState, Sym);
+  assert(String && "String not found in ViewMap");
+  QualType StringTy = dyn_cast<TypedValueRegion>(String)->getValueType();
+
+  std::unique_ptr<StackHintGeneratorForSymbol> StackHint = nullptr;
+  SmallString<256> Buf;
+  llvm::raw_svector_ostream OS(Buf);
+  OS << "Inner buffer of '" << StringTy.getAsString() << "' ";
+
+  if (N->getLocation().getKind() == ProgramPoint::PostImplicitCallKind) {
+    OS << "deallocated by call to destructor";
+    StackHint = std::make_unique<StackHintGeneratorForSymbol>(
+        Sym, "Returning; inner buffer was deallocated");
+  } else {
+    OS << "reallocated by call to '";
+    if (const auto *MemCallE = dyn_cast<CXXMemberCallExpr>(S)) {
+      OS << MemCallE->getMethodDecl()->getDeclName();
+    } else if (const auto *OpCallE = dyn_cast<CXXOperatorCallExpr>(S)) {
+      OS << OpCallE->getDirectCallee()->getDeclName();
+    } else if (const auto *CallE = dyn_cast<CallExpr>(S)) {
+      auto &CEMgr = BRC.getStateManager().getCallEventManager();
+      CallEventRef<> Call = CEMgr.getSimpleCall(CallE, State, LC);
+      if (const auto *D = dyn_cast_or_null<NamedDecl>(Call->getDecl()))
+        OS << D->getDeclName();
+      else
+        OS << "unknown";
+    }
+    OS << "'";
+    StackHint = std::make_unique<StackHintGeneratorForSymbol>(
+        Sym, "Returning; inner buffer was reallocated");
+  }
+
+  PathDiagnosticLocation Pos;
+  if (!S) {
+    auto PIC = N->getLocation().getAs<PostImplicitCall>();
+    if (!PIC)
+      return nullptr;
+    Pos = PathDiagnosticLocation(PIC->getLocation(), BRC.getSourceManager());
+  } else {
+    Pos = PathDiagnosticLocation(S, BRC.getSourceManager(), LC);
+  }
+
+  auto P = std::make_shared<PathDiagnosticEventPiece>(Pos, OS.str(), true);
+  BR.addCallStackHint(P, std::move(StackHint));
+  return P;
 }
 
 namespace clang {

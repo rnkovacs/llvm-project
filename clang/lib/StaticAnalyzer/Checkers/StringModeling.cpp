@@ -31,9 +31,9 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ViewMap, const MemRegion *, ViewSet)
 
 namespace {
 
-class StringModeling
-    : public Checker<eval::Call, check::PostStmt<DeclStmt>, check::PostCall,
-                     check::LiveSymbols, check::DeadSymbols> {
+class StringModeling : public Checker<eval::Call, check::PostCall,
+                                      check::LiveSymbols, check::DeadSymbols> {
+
   CallDescription StringCStr, StringData, ViewData;
 
 public:
@@ -74,12 +74,11 @@ public:
         ViewData({"std", "basic_string_view", "data"}) {}
 
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
-  void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
   void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
-                  const char *Sep) const;
+                  const char *Sep) const override;
 };
 
 } // end of anonymous namespace
@@ -102,17 +101,6 @@ static QualType getInnerPointerType(const CallEvent &Call, CheckerContext &C) {
 
   auto InnerValueType = TemplateArgs[0].getAsType();
   return C.getASTContext().getPointerType(InnerValueType.getCanonicalType());
-}
-
-static const MemRegion *getStringFor(ProgramStateRef State, SymbolRef Target) {
-  ViewMapTy Map = State->get<ViewMap>();
-  for (const auto &Entry : Map) {
-    for (const SymbolRef View : Entry.second) {
-      if (View == Target)
-        return Entry.first;
-    }
-  }
-  return nullptr;
 }
 
 static void getPointerAndBindToCall(const CallEvent &Call,
@@ -168,7 +156,7 @@ bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
     // created from a string. FIXME: Is includeBaseRegions=true needed?
     SymbolRef View = ViewVal.getValue().getAsSymbol(true);
     assert(View && "View is not a symbol!");
-    const MemRegion *String = getStringFor(State, View);
+    const MemRegion *String = innerptr::getStringFor(State, View);
     if (!String)
       return false;
 
@@ -195,51 +183,6 @@ static bool isStringViewConversion(const CallEvent &Call) {
     return false;
 
   return true;
-}
-/*
-static bool isViewDeclFromString(const VarDecl *VD, CheckerContext &C) {
-  if (!VD || !VD->hasInit())
-    return false;
-
-  CXXRecordDecl *RD = VD->getType()->getAsCXXRecordDecl();
-  if (!RD || !RD->isInStdNamespace() || RD->getName() != "basic_string_view")
-    return false;
-
-  const auto *Init =
-dyn_cast<CXXMemberCallExpr>(VD->getInit()->IgnoreImpCasts()); if (!Init) return
-false;
-
-  CXXRecordDecl *InitRD = Init->getRecordDecl();
-  if (!InitRD || !InitRD->isInStdNamespace() || InitRD->getName() !=
-"basic_string") return false;
-
-  return true;
-}*/
-
-void StringModeling::checkPostStmt(const DeclStmt *DS,
-                                   CheckerContext &C) const {
-  /*
-    // FIXME: Support multiple decls.
-    if (!DS->isSingleDecl())
-      return;
-
-    const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());
-    if (!isViewDeclFromString(VD, C))
-      return;
-
-    ProgramStateRef State = C.getState();
-    const LocationContext *LC = C.getLocationContext();
-
-    State->dump();
-    llvm::errs() << "\n\n";
-
-    const auto *Init =
-    dyn_cast<CXXMemberCallExpr>(VD->getInit()->IgnoreImpCasts());
-    //llvm::errs() << Init->getNumArgs();
-    State->getSVal(Init, LC).dump();
-
-    const MemRegion *View = State->getLValue(VD, LC).getAsRegion();
-  */
 }
 
 void StringModeling::checkPostCall(const CallEvent &Call,
@@ -339,11 +282,10 @@ PathDiagnosticPieceRef StringModeling::StringModelingBRVisitor::VisitNode(
     return nullptr;
 
   const Stmt *S = N->getStmtForDiagnostics();
-
   if (!S)
     return nullptr;
 
-  const MemRegion *String = getStringFor(N->getState(), Sym);
+  const MemRegion *String = innerptr::getStringFor(N->getState(), Sym);
   if (!String)
     return nullptr;
 
@@ -354,7 +296,7 @@ PathDiagnosticPieceRef StringModeling::StringModelingBRVisitor::VisitNode(
   llvm::raw_svector_ostream OS(Buf);
   OS << "Pointer to inner buffer of '" << ObjTy.getAsString()
      << "' obtained here";
- 
+
   PathDiagnosticLocation Pos(S, BRC.getSourceManager(),
                              N->getLocationContext());
   return std::make_shared<PathDiagnosticEventPiece>(Pos, OS.str(), true);
@@ -366,6 +308,17 @@ namespace innerptr {
 
 std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(SymbolRef Sym) {
   return std::make_unique<StringModeling::StringModelingBRVisitor>(Sym);
+}
+
+const MemRegion *getStringFor(ProgramStateRef State, SymbolRef Target) {
+  ViewMapTy Map = State->get<ViewMap>();
+  for (const auto &Entry : Map) {
+    for (const SymbolRef View : Entry.second) {
+      if (View == Target)
+        return Entry.first;
+    }
+  }
+  return nullptr;
 }
 
 void markViewsReleased(ProgramStateRef State, const MemRegion *String,

@@ -31,6 +31,7 @@ void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C);
 
 std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(SymbolRef Sym);
+const MemRegion *getStringFor(ProgramStateRef State, SymbolRef Target);
 
 } // namespace innerptr
 } // namespace ento
