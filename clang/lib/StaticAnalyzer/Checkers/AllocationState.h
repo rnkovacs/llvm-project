@@ -20,7 +20,7 @@ namespace allocation_state {
 ProgramStateRef markReleased(ProgramStateRef State, SymbolRef Sym,
                              const Expr *Origin);
 
-ProgramStateRef markViewReleased(ProgramStateRef State, SymbolRef View);
+ProgramStateRef markViewReleased(ProgramStateRef State, const MemRegion *View);
 
 /// This function provides an additional visitor that augments the bug report
 /// with information relevant to memory errors caused by the misuse of

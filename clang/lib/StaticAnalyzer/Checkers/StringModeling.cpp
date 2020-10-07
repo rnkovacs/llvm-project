@@ -30,12 +30,15 @@
 using namespace clang;
 using namespace ento;
 
-REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(ViewSet, SymbolRef)
-REGISTER_MAP_WITH_PROGRAMSTATE(ViewMap, const MemRegion *, ViewSet)
+REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(SymbolSet, SymbolRef)
+REGISTER_MAP_WITH_PROGRAMSTATE(CastSymbols, const MemRegion *, SymbolSet)
+
+REGISTER_SET_FACTORY_WITH_PROGRAMSTATE(RegionSet, const MemRegion *)
+REGISTER_MAP_WITH_PROGRAMSTATE(ViewRegions, const MemRegion *, RegionSet)
 
 namespace {
 
-class StringModeling : public Checker<eval::Call, check::PostCall,
+class StringModeling : public Checker<eval::Call, check::PostCall, check::Bind,
                                       check::LiveSymbols, check::DeadSymbols> {
 
   using HandlerFn = bool (StringModeling::*)(const CallEvent &,
@@ -53,26 +56,40 @@ class StringModeling : public Checker<eval::Call, check::PostCall,
   bool handleViewData(const CallEvent &Call, CheckerContext &C) const;
 
 public:
-  /// Model std::basic_string::c_str, std::basic_string::data, and
-  /// std::basic_string_view::data calls.
+  /// Create a unique symbol for the buffer pointer of a string. Use this
+  /// symbol as a result for all the relevant methods in StringHandlers.
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
 
-  /// For each std::basic_string to std::basic_string_view conversion, record
-  /// the relationship between the view and the string in ViewMap.
+  /// Step 1 of recording a view in CastSymbols: on operator string_view,
+  /// save the return symbol of the cast.
+  ///
+  /// Store at this point:
+  ///   s |-> return symbol of s.operator string_view
+  ///
+  /// Result: s |-> { symbol }
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+
+  /// Step 2 of recording a view in CastSymbols: after the declaration, look up
+  /// the symbol of Step 1 in the Store. Associate its region with the string.
+  ///
+  /// Store at this point:
+  ///   v |-> return symbol of s.operator string_view
+  ///
+  /// Result: s |-> { v }
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
 
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
 
-  /// Show the contents of ViewMap in the exploded graph dump.
+  /// Show the contents of CastSymbols in the exploded graph dump.
   void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
                   const char *Sep) const override;
 
   class StringModelingBRVisitor : public BugReporterVisitor {
-    SymbolRef Sym;
+    const MemRegion *Reg;
 
   public:
-    StringModelingBRVisitor(SymbolRef Sym) : Sym(Sym) {}
+    StringModelingBRVisitor(const MemRegion *Reg) : Reg(Reg) {}
 
     static void *getTag() {
       static int Tag = 0;
@@ -87,11 +104,11 @@ public:
     VisitNode(const ExplodedNode *N, BugReporterContext &BRC,
               PathSensitiveBugReport &BR) override;
 
-    bool isSymbolTracked(ProgramStateRef State, SymbolRef Sym) {
-      ViewMapTy Map = State->get<ViewMap>();
+    bool isSymbolTracked(ProgramStateRef State, const MemRegion *Target) {
+      ViewRegionsTy Map = State->get<ViewRegions>();
       for (const auto &Entry : Map) {
-        for (const SymbolRef View : Entry.second) {
-          if (View == Sym)
+        for (const MemRegion *View : Entry.second) {
+          if (View == Target)
             return true;
         }
       }
@@ -160,7 +177,7 @@ bool StringModeling::handleStringCStrData(const CallEvent &Call,
 bool StringModeling::handleViewData(const CallEvent &Call,
                                     CheckerContext &C) const {
   // Step 1: See if there is a string associated with this view.
-  // For this, get the symbol of the view and look it up in ViewMap.
+  // For this, get the symbol of the view and look it up in CastSymbols.
   const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
   const MemRegion *ViewRegion = ICall->getCXXThisVal().getAsRegion();
   if (!ViewRegion)
@@ -172,11 +189,11 @@ bool StringModeling::handleViewData(const CallEvent &Call,
   if (!ViewVal)
     return false;
 
-  // This should be a symbol that we saved in ViewMap if the view was
+  // This should be a symbol that we saved in CastSymbols if the view was
   // created from a string. FIXME: Is includeBaseRegions=true needed?
   SymbolRef View = ViewVal.getValue().getAsSymbol(true);
   assert(View && "View is not a symbol!");
-  const MemRegion *String = innerptr::getStringFor(State, View);
+  const MemRegion *String = innerptr::getStringForSymbol(State, View);
   if (!String)
     return false;
 
@@ -210,6 +227,34 @@ static bool isStringViewConversion(const CallEvent &Call) {
   return true;
 }
 
+void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+  // v |-> conj$6
+  // save:
+  // s |-> { v }
+  if (SymbolRef Sym = Val.getAsSymbol(true)) {
+    const MemRegion *String = innerptr::getStringForSymbol(C.getState(), Sym);
+    if (!String)
+      return;
+
+    // The symbol is in the CastSymbols map.
+    // Add (String, Loc) to the ViewRegions map.
+    ProgramStateRef State = C.getState();
+    const MemRegion *View = Loc.getAsRegion();
+    if (!View)
+      return;
+
+    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+    const RegionSet *OldSet = State->get<ViewRegions>(String);
+    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+    // FIXME: what does this ensure again?
+    assert(C.wasInlined || !NewSet.contains(View));
+    NewSet = F.add(NewSet, View);
+    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    return;
+  }
+}
+
 void StringModeling::checkPostCall(const CallEvent &Call,
                                    CheckerContext &C) const {
   if (isStringViewConversion(Call)) {
@@ -227,23 +272,23 @@ void StringModeling::checkPostCall(const CallEvent &Call,
 
     ProgramStateRef State = C.getState();
 
-    ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
-    const ViewSet *OldSet = State->get<ViewMap>(String);
-    ViewSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+    SymbolSet::Factory &F = State->getStateManager().get_context<SymbolSet>();
+    const SymbolSet *OldSet = State->get<CastSymbols>(String);
+    SymbolSet NewSet = OldSet ? *OldSet : F.getEmptySet();
 
     // FIXME: what does this ensure again?
     assert(C.wasInlined || !NewSet.contains(View));
     NewSet = F.add(NewSet, View);
 
-    C.addTransition(State->set<ViewMap>(String, NewSet));
+    C.addTransition(State->set<CastSymbols>(String, NewSet));
     return;
   }
 
   if (const auto *CC = dyn_cast<CXXConstructorCall>(&Call)) {
     const auto *CD = dyn_cast<CXXConstructorDecl>(Call.getDecl());
-    if (!CD || !CD->isCopyConstructor() || CD->getNumParams() != 1)
+    if (!CD || !CD->isCopyConstructor())
       return;
-
+/*
     const CXXRecordDecl *RD = CD->getParent();
     if (RD->getName() != "basic_string_view")
       return;
@@ -253,12 +298,32 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     const auto *II = Arg->getType().getBaseTypeIdentifier();
     if (!II || II->getName() != "basic_string_view")
       return;
-
-    const MemRegion *CopiedRegion = CC->getArgSVal(0).getAsRegion();
-    if (!CopiedRegion)
+*/
+    const MemRegion *CopiedView = CC->getArgSVal(0).getAsRegion();
+    if (!CopiedView)
       return;
 
     ProgramStateRef State = C.getState();
+    const MemRegion *String = innerptr::getStringForRegion(State, CopiedView);
+    if (!String)
+      return;
+
+    // CopiedView is in ViewRegions.
+    const MemRegion *CreatedView = CC->getCXXThisVal().getAsRegion();
+    if (!CreatedView)
+      return;
+
+    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+    const RegionSet *OldSet = State->get<ViewRegions>(String);
+    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+    // FIXME: what does this ensure again?
+    assert(C.wasInlined || !NewSet.contains(CreatedView));
+    NewSet = F.add(NewSet, CreatedView);
+    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    return;
+
+/*
     StoreManager &StoreMgr = C.getStoreManager();
 
     auto CopiedVal = StoreMgr.getDefaultBinding(State->getStore(), CopiedRegion);
@@ -273,10 +338,6 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     // If it is not, it will return a nullptr and we exit.
     const MemRegion *String = innerptr::getStringFor(State, CopiedView);
     if (!String)
-      return;
-
-    const MemRegion *CreatedView = CC->getCXXThisVal().getAsRegion();
-    if (!CreatedView)
       return;
 
     CreatedView->dump();
@@ -299,18 +360,33 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     SVal R = StoreMgr.getBinding(S, CC->getCXXThisVal().castAs<Loc>());
     R.dump();
     llvm::errs() << "\n";
+*/
   }
 }
 
 void StringModeling::printState(raw_ostream &Out, ProgramStateRef State,
                                 const char *NL, const char *Sep) const {
-  ViewMapTy Map = State->get<ViewMap>();
-  if (!Map.isEmpty()) {
-    Out << Sep << "View symbols:" << NL;
-    for (const auto &Entry : Map) {
+  CastSymbolsTy CSMap = State->get<CastSymbols>();
+  if (!CSMap.isEmpty()) {
+    Out << Sep << "Cast symbols:" << NL;
+    for (const auto &Entry : CSMap) {
       Entry.first->dumpToStream(Out);
       Out << ": {";
-      for (const SymbolRef View : Entry.second) {
+      for (const SymbolRef Sym : Entry.second) {
+        Sym->dumpToStream(Out);
+        Out << ", ";
+      }
+      Out << "}" << NL;
+    }
+  }
+
+  ViewRegionsTy VRMap = State->get<ViewRegions>();
+  if (!VRMap.isEmpty()) {
+    Out << Sep << "View regions:" << NL;
+    for (const auto &Entry : VRMap) {
+      Entry.first->dumpToStream(Out);
+      Out << ": {";
+      for (const MemRegion *View : Entry.second) {
         View->dumpToStream(Out);
         Out << ", ";
       }
@@ -323,7 +399,7 @@ void StringModeling::checkLiveSymbols(ProgramStateRef State,
                                       SymbolReaper &SymReaper) const {
   // While a view is live, make sure that the corresponding string
   // pointer symbols are also live.
-  ViewMapTy Map = State->get<ViewMap>();
+  CastSymbolsTy Map = State->get<CastSymbols>();
   for (const auto &Entry : Map) {
     for (const SymbolRef View : Entry.second) {
       if (SymReaper.isLive(View)) {
@@ -334,28 +410,29 @@ void StringModeling::checkLiveSymbols(ProgramStateRef State,
   }
 }
 
+// FIXME: ViewRegions
 void StringModeling::checkDeadSymbols(SymbolReaper &SymReaper,
                                       CheckerContext &C) const {
   ProgramStateRef State = C.getState();
 
-  ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
-  ViewMapTy Map = State->get<ViewMap>();
+  SymbolSet::Factory &F = State->getStateManager().get_context<SymbolSet>();
+  CastSymbolsTy Map = State->get<CastSymbols>();
 
   for (const auto &Entry : Map) {
     if (!SymReaper.isLiveRegion(Entry.first)) {
       // Due to incomplete destructor support, some dead regions might
       // remain in the program state map. Clean them up.
-      State = State->remove<ViewMap>(Entry.first);
+      State = State->remove<CastSymbols>(Entry.first);
     }
-    if (const ViewSet *OldSet = State->get<ViewMap>(Entry.first)) {
-      ViewSet CleanedUpSet = *OldSet;
+    if (const SymbolSet *OldSet = State->get<CastSymbols>(Entry.first)) {
+      SymbolSet CleanedUpSet = *OldSet;
       for (const auto Symbol : Entry.second) {
         if (!SymReaper.isLive(Symbol))
           CleanedUpSet = F.remove(CleanedUpSet, Symbol);
       }
       State = CleanedUpSet.isEmpty()
-                  ? State->remove<ViewMap>(Entry.first)
-                  : State->set<ViewMap>(Entry.first, CleanedUpSet);
+                  ? State->remove<CastSymbols>(Entry.first)
+                  : State->set<CastSymbols>(Entry.first, CleanedUpSet);
     }
   }
 
@@ -364,15 +441,15 @@ void StringModeling::checkDeadSymbols(SymbolReaper &SymReaper,
 
 PathDiagnosticPieceRef StringModeling::StringModelingBRVisitor::VisitNode(
     const ExplodedNode *N, BugReporterContext &BRC, PathSensitiveBugReport &) {
-  if (!isSymbolTracked(N->getState(), Sym) ||
-      isSymbolTracked(N->getFirstPred()->getState(), Sym))
+  if (!isSymbolTracked(N->getState(), Reg) ||
+      isSymbolTracked(N->getFirstPred()->getState(), Reg))
     return nullptr;
 
   const Stmt *S = N->getStmtForDiagnostics();
   if (!S)
     return nullptr;
 
-  const MemRegion *String = innerptr::getStringFor(N->getState(), Sym);
+  const MemRegion *String = innerptr::getStringForRegion(N->getState(), Reg);
   if (!String)
     return nullptr;
 
@@ -393,12 +470,12 @@ namespace clang {
 namespace ento {
 namespace innerptr {
 
-std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(SymbolRef Sym) {
-  return std::make_unique<StringModeling::StringModelingBRVisitor>(Sym);
+std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(const MemRegion *Reg) {
+  return std::make_unique<StringModeling::StringModelingBRVisitor>(Reg);
 }
 
-const MemRegion *getStringFor(ProgramStateRef State, SymbolRef Target) {
-  ViewMapTy Map = State->get<ViewMap>();
+const MemRegion *getStringForSymbol(ProgramStateRef State, SymbolRef Target) {
+  CastSymbolsTy Map = State->get<CastSymbols>();
   for (const auto &Entry : Map) {
     for (const SymbolRef View : Entry.second) {
       if (View == Target)
@@ -408,13 +485,24 @@ const MemRegion *getStringFor(ProgramStateRef State, SymbolRef Target) {
   return nullptr;
 }
 
+const MemRegion *getStringForRegion(ProgramStateRef State, const MemRegion *Target) {
+  ViewRegionsTy Map = State->get<ViewRegions>();
+  for (const auto &Entry : Map) {
+    for (const MemRegion *View : Entry.second) {
+      if (View == Target)
+        return Entry.first;
+    }
+  }
+  return nullptr;
+}
+
 void markViewsReleased(ProgramStateRef State, const MemRegion *String,
                        CheckerContext &C) {
-  if (const ViewSet *Set = State->get<ViewMap>(String)) {
-    for (const SymbolRef View : *Set)
+  if (const RegionSet *Set = State->get<ViewRegions>(String)) {
+    for (const MemRegion *View : *Set)
       State = allocation_state::markViewReleased(State, View);
 
-    C.addTransition(State->remove<ViewMap>(String));
+    C.addTransition(State->remove<ViewRegions>(String));
     return;
   }
 }

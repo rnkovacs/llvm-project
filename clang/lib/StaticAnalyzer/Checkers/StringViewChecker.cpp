@@ -24,7 +24,7 @@
 using namespace clang;
 using namespace ento;
 
-REGISTER_SET_WITH_PROGRAMSTATE(ReleasedViews, SymbolRef)
+REGISTER_SET_WITH_PROGRAMSTATE(ReleasedViews, const MemRegion *)
 
 namespace {
 
@@ -82,16 +82,16 @@ class StringViewChecker
        &StringViewChecker::checkUse},
   };
 
-  void reportUseAfterFree(CheckerContext &C, SymbolRef Sym) const;
+  void reportUseAfterFree(CheckerContext &C, const MemRegion *View) const;
   void checkEscapeOnReturn(const ReturnStmt *S, CheckerContext &C) const;
   void checkUse(const CXXInstanceCall *ICall, CheckerContext &C) const;
 
 public:
   class StringViewBRVisitor : public BugReporterVisitor {
-    SymbolRef Sym;
+    const MemRegion *Sym;
 
   public:
-    StringViewBRVisitor(SymbolRef Sym) : Sym(Sym) {}
+    StringViewBRVisitor(const MemRegion *Sym) : Sym(Sym) {}
 
     static void *getTag() {
       static int Tag = 0;
@@ -131,8 +131,8 @@ void StringViewChecker::printState(raw_ostream &Out, ProgramStateRef State,
   const ReleasedViewsTy &Set = State->get<ReleasedViews>();
   if (!Set.isEmpty()) {
     Out << Sep << "Released views:" << NL;
-    for (const SymbolRef Sym : Set) {
-      Sym->dumpToStream(Out);
+    for (const MemRegion *View : Set) {
+      View->dumpToStream(Out);
       Out << ", ";
     }
   }
@@ -140,11 +140,16 @@ void StringViewChecker::printState(raw_ostream &Out, ProgramStateRef State,
 
 void StringViewChecker::checkLocation(SVal V, bool isLoad, const Stmt *S,
                                       CheckerContext &C) const {
+  if (const MemRegion *Region = V.getAsRegion()) {
+    if (C.getState()->contains<ReleasedViews>(Region))
+      reportUseAfterFree(C, Region);
+  }
+  /*
   if (auto Sym = V.getAs<nonloc::SymbolVal>()) {
     SymbolRef View = Sym->getSymbol();
     if (C.getState()->contains<ReleasedViews>(View))
       reportUseAfterFree(C, View);
-  }
+  }*/
 }
 
 void StringViewChecker::checkPreStmt(const ReturnStmt *S,
@@ -159,6 +164,7 @@ void StringViewChecker::checkEndFunction(const ReturnStmt *S,
 
 void StringViewChecker::checkEscapeOnReturn(const ReturnStmt *S,
                                             CheckerContext &C) const {
+  /*
   if (!S)
     return;
 
@@ -173,7 +179,7 @@ void StringViewChecker::checkEscapeOnReturn(const ReturnStmt *S,
     if (C.getState()->contains<ReleasedViews>(View)) {
       reportUseAfterFree(C, View);
     }
-  }
+  }*/
 }
 
 void StringViewChecker::checkPreCall(const CallEvent &Call,
@@ -197,11 +203,13 @@ void StringViewChecker::checkPreCall(const CallEvent &Call,
 
 void StringViewChecker::checkUse(const CXXInstanceCall *Call,
                                  CheckerContext &C) const {
-  const MemRegion *ViewRegion = Call->getCXXThisVal().getAsRegion();
-  if (!ViewRegion)
+  const MemRegion *View = Call->getCXXThisVal().getAsRegion();
+  if (!View)
     return;
 
   ProgramStateRef State = C.getState();
+
+  /*
   StoreManager &StoreMgr = C.getStoreManager();
 
   auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
@@ -209,6 +217,7 @@ void StringViewChecker::checkUse(const CXXInstanceCall *Call,
     return;
 
   SymbolRef View = ViewVal.getValue().getAsSymbol(true);
+  */
   if (State->contains<ReleasedViews>(View)) {
     reportUseAfterFree(C, View);
   }
@@ -219,9 +228,9 @@ void StringViewChecker::checkDeadSymbols(SymbolReaper &SymReaper,
   ProgramStateRef State = C.getState();
   const ReleasedViewsTy &Set = State->get<ReleasedViews>();
 
-  for (const SymbolRef Sym : Set) {
-    if (!SymReaper.isLive(Sym))
-      State = State->remove<ReleasedViews>(Sym);
+  for (const MemRegion *View : Set) {
+    if (!SymReaper.isLiveRegion(View))
+      State = State->remove<ReleasedViews>(View);
   }
 
   C.addTransition(State);
@@ -234,7 +243,7 @@ ProgramStateRef StringViewChecker::checkPointerEscape(
 }
 
 void StringViewChecker::reportUseAfterFree(CheckerContext &C,
-                                           SymbolRef Sym) const {
+                                           const MemRegion *View) const {
   ExplodedNode *N = C.generateErrorNode();
   if (!N)
     return;
@@ -245,8 +254,8 @@ void StringViewChecker::reportUseAfterFree(CheckerContext &C,
 
   auto R =
       std::make_unique<PathSensitiveBugReport>(DanglingViewBugTy, OS.str(), N);
-  R->addVisitor(std::make_unique<StringViewBRVisitor>(Sym));
-  R->addVisitor(innerptr::getStringModelingBRVisitor(Sym));
+  R->addVisitor(std::make_unique<StringViewBRVisitor>(View));
+  R->addVisitor(innerptr::getStringModelingBRVisitor(View));
   C.emitReport(std::move(R));
 }
 
@@ -264,7 +273,7 @@ StringViewChecker::StringViewBRVisitor::VisitNode(const ExplodedNode *N,
   const Stmt *S = N->getStmtForDiagnostics();
   const LocationContext *LC = N->getLocationContext();
 
-  const MemRegion *String = innerptr::getStringFor(PrevState, Sym);
+  const MemRegion *String = innerptr::getStringForRegion(PrevState, Sym);
   assert(String && "String not found in ViewMap");
   QualType StringTy = dyn_cast<TypedValueRegion>(String)->getValueType();
 
@@ -275,8 +284,8 @@ StringViewChecker::StringViewBRVisitor::VisitNode(const ExplodedNode *N,
 
   if (N->getLocation().getKind() == ProgramPoint::PostImplicitCallKind) {
     OS << "deallocated by call to destructor";
-    StackHint = std::make_unique<StackHintGeneratorForSymbol>(
-        Sym, "Returning; inner buffer was deallocated");
+    //StackHint = std::make_unique<StackHintGeneratorForSymbol>(
+    //    Sym, "Returning; inner buffer was deallocated");
   } else {
     OS << "reallocated by call to '";
     if (const auto *MemCallE = dyn_cast<CXXMemberCallExpr>(S)) {
@@ -292,8 +301,8 @@ StringViewChecker::StringViewBRVisitor::VisitNode(const ExplodedNode *N,
         OS << "unknown";
     }
     OS << "'";
-    StackHint = std::make_unique<StackHintGeneratorForSymbol>(
-        Sym, "Returning; inner buffer was reallocated");
+    //StackHint = std::make_unique<StackHintGeneratorForSymbol>(
+    //    Sym, "Returning; inner buffer was reallocated");
   }
 
   PathDiagnosticLocation Pos;
@@ -315,7 +324,7 @@ namespace clang {
 namespace ento {
 namespace allocation_state {
 
-ProgramStateRef markViewReleased(ProgramStateRef State, SymbolRef View) {
+ProgramStateRef markViewReleased(ProgramStateRef State, const MemRegion *View) {
   return State->add<ReleasedViews>(View);
 }
 
