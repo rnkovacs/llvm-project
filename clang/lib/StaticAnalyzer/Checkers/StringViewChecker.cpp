@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // FIXME: Add docs.
+// TODO: Support returning the view object itself.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,12 +29,62 @@ REGISTER_SET_WITH_PROGRAMSTATE(ReleasedViews, SymbolRef)
 namespace {
 
 class StringViewChecker
-    : public Checker<check::Location, check::PostCall,
+    : public Checker<check::Location, check::PreCall,
                      check::PreStmt<ReturnStmt>, check::EndFunction,
                      check::PointerEscape, check::DeadSymbols> {
 
+  using HandlerFn = void (StringViewChecker::*)(const CXXInstanceCall *,
+                                                CheckerContext &) const;
+
+  // FIXME: Should using capacity checking methods be considered an error
+  // after a view is released?
+  CallDescriptionMap<HandlerFn> ViewHandlers{
+      // Iterators
+      {{{"std", "basic_string_view", "begin"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "cbegin"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "end"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "cend"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "rbegin"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "crbegin"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "rend"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "crend"}}, &StringViewChecker::checkUse},
+
+      // Element access
+      {{{"std", "basic_string_view", "at"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "front"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "back"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "data"}}, &StringViewChecker::checkUse},
+
+      // Modifiers
+      {{{"std", "basic_string_view", "remove_prefix"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "remove_suffix"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "swap"}}, &StringViewChecker::checkUse},
+
+      // Operations
+      {{{"std", "basic_string_view", "copy"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "substr"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "compare"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "starts_with"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "ends_with"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "find"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "rfind"}}, &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "find_first_of"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "find_last_of"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "find_first_not_of"}},
+       &StringViewChecker::checkUse},
+      {{{"std", "basic_string_view", "find_last_not_of"}},
+       &StringViewChecker::checkUse},
+  };
+
   void reportUseAfterFree(CheckerContext &C, SymbolRef Sym) const;
   void checkEscapeOnReturn(const ReturnStmt *S, CheckerContext &C) const;
+  void checkUse(const CXXInstanceCall *ICall, CheckerContext &C) const;
 
 public:
   class StringViewBRVisitor : public BugReporterVisitor {
@@ -63,7 +114,7 @@ public:
                      CheckerContext &C) const;
   void checkPreStmt(const ReturnStmt *S, CheckerContext &C) const;
   void checkEndFunction(const ReturnStmt *S, CheckerContext &C) const;
-  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
   ProgramStateRef checkPointerEscape(ProgramStateRef State,
                                      const InvalidatedSymbols &Escaped,
@@ -125,27 +176,41 @@ void StringViewChecker::checkEscapeOnReturn(const ReturnStmt *S,
   }
 }
 
-void StringViewChecker::checkPostCall(const CallEvent &Call,
-                                      CheckerContext &C) const {
-  if (const auto *MemOp = dyn_cast<CXXMemberOperatorCall>(&Call)) {
-    const auto *MD = dyn_cast<CXXMethodDecl>(Call.getDecl());
-    if (!MD || MD->getNameAsString() != "operator[]")
-      return;
+void StringViewChecker::checkPreCall(const CallEvent &Call,
+                                     CheckerContext &C) const {
+  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+  if (!ICall)
+    return;
 
-    // if this is a [] call, and the this symbol is in the set, bug
-    const MemRegion *ViewRegion = MemOp->getCXXThisVal().getAsRegion();
-    if (!ViewRegion)
-      return;
+  const auto *MD = dyn_cast<CXXMethodDecl>(Call.getDecl());
+  if (MD && MD->getNameAsString() == "operator[]") {
+    checkUse(ICall, C);
+    return;
+  }
 
-    ProgramStateRef State = C.getState();
-    StoreManager &StoreMgr = C.getStoreManager();
-    auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
-    if (!ViewVal)
-      return;
+  const auto *Handler = ViewHandlers.lookup(Call);
+  if (!Handler)
+    return;
 
-    SymbolRef View = ViewVal.getValue().getAsSymbol(true);
-    if (State->contains<ReleasedViews>(View))
-      reportUseAfterFree(C, View);
+  (this->**Handler)(ICall, C);
+}
+
+void StringViewChecker::checkUse(const CXXInstanceCall *Call,
+                                 CheckerContext &C) const {
+  const MemRegion *ViewRegion = Call->getCXXThisVal().getAsRegion();
+  if (!ViewRegion)
+    return;
+
+  ProgramStateRef State = C.getState();
+  StoreManager &StoreMgr = C.getStoreManager();
+
+  auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
+  if (!ViewVal)
+    return;
+
+  SymbolRef View = ViewVal.getValue().getAsSymbol(true);
+  if (State->contains<ReleasedViews>(View)) {
+    reportUseAfterFree(C, View);
   }
 }
 

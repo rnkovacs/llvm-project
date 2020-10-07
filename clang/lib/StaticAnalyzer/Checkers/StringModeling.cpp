@@ -11,6 +11,10 @@
 // symbolic value for all c_str() or data() calls on the same string (default
 // behavior gives different symbols), making the analysis more precise.
 //
+// TODO: Support the construction of a view from a view.
+// TODO: Support the assignment of a string to a view.
+// TODO: Support the assignment of a view to a view.
+//
 //===----------------------------------------------------------------------===//
 
 #include "AllocationState.h"
@@ -34,9 +38,36 @@ namespace {
 class StringModeling : public Checker<eval::Call, check::PostCall,
                                       check::LiveSymbols, check::DeadSymbols> {
 
-  CallDescription StringCStr, StringData, ViewData;
+  using HandlerFn = bool (StringModeling::*)(const CallEvent &,
+                                             CheckerContext &) const;
+
+  CallDescriptionMap<HandlerFn> StringHandlers{
+      {{{"std", "basic_string", "c_str"}},
+       &StringModeling::handleStringCStrData},
+      {{{"std", "basic_string", "data"}},
+       &StringModeling::handleStringCStrData},
+      {{{"std", "basic_string_view", "data"}},
+       &StringModeling::handleViewData}};
+
+  bool handleStringCStrData(const CallEvent &Call, CheckerContext &C) const;
+  bool handleViewData(const CallEvent &Call, CheckerContext &C) const;
 
 public:
+  /// Model std::basic_string::c_str, std::basic_string::data, and
+  /// std::basic_string_view::data calls.
+  bool evalCall(const CallEvent &Call, CheckerContext &C) const;
+
+  /// For each std::basic_string to std::basic_string_view conversion, record
+  /// the relationship between the view and the string in ViewMap.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+
+  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
+  void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
+
+  /// Show the contents of ViewMap in the exploded graph dump.
+  void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
+                  const char *Sep) const override;
+
   class StringModelingBRVisitor : public BugReporterVisitor {
     SymbolRef Sym;
 
@@ -67,18 +98,6 @@ public:
       return false;
     }
   };
-
-  StringModeling()
-      : StringCStr({"std", "basic_string", "c_str"}),
-        StringData({"std", "basic_string", "data"}),
-        ViewData({"std", "basic_string_view", "data"}) {}
-
-  bool evalCall(const CallEvent &Call, CheckerContext &C) const;
-  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
-  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
-  void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
-  void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
-                  const char *Sep) const override;
 };
 
 } // end of anonymous namespace
@@ -127,46 +146,52 @@ static void getPointerAndBindToCall(const CallEvent &Call,
   C.addTransition(State->BindExpr(CallExpr, LC, Ptr));
 }
 
+bool StringModeling::handleStringCStrData(const CallEvent &Call,
+                                          CheckerContext &C) const {
+  const auto *MemCall = dyn_cast<CXXMemberCall>(&Call);
+  const MemRegion *String = MemCall->getCXXThisVal().getAsRegion();
+  if (!String)
+    return false;
+
+  getPointerAndBindToCall(Call, String, C);
+  return true;
+}
+
+bool StringModeling::handleViewData(const CallEvent &Call,
+                                    CheckerContext &C) const {
+  // Step 1: See if there is a string associated with this view.
+  // For this, get the symbol of the view and look it up in ViewMap.
+  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+  const MemRegion *ViewRegion = ICall->getCXXThisVal().getAsRegion();
+  if (!ViewRegion)
+    return false;
+
+  ProgramStateRef State = C.getState();
+  StoreManager &StoreMgr = C.getStoreManager();
+  auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
+  if (!ViewVal)
+    return false;
+
+  // This should be a symbol that we saved in ViewMap if the view was
+  // created from a string. FIXME: Is includeBaseRegions=true needed?
+  SymbolRef View = ViewVal.getValue().getAsSymbol(true);
+  assert(View && "View is not a symbol!");
+  const MemRegion *String = innerptr::getStringFor(State, View);
+  if (!String)
+    return false;
+
+  // Step 2: Create or find an existing pointer symbol for this string
+  // and bind it to the call expression.
+  getPointerAndBindToCall(Call, String, C);
+  return true;
+}
+
 bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
-  if (Call.isCalled(StringCStr) || Call.isCalled(StringData)) {
-    const auto *MemCall = dyn_cast<CXXMemberCall>(&Call);
-    const MemRegion *String = MemCall->getCXXThisVal().getAsRegion();
-    if (!String)
-      return false;
+  const auto *Handler = StringHandlers.lookup(Call);
+  if (!Handler)
+    return false;
 
-    getPointerAndBindToCall(Call, String, C);
-    return true;
-  }
-
-  if (Call.isCalled(ViewData)) {
-    // Step 1: See if there is a string associated with this view.
-    // For this, get the symbol of the view and look it up in ViewMap.
-    const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
-    const MemRegion *ViewRegion = ICall->getCXXThisVal().getAsRegion();
-    if (!ViewRegion)
-      return false;
-
-    ProgramStateRef State = C.getState();
-    StoreManager &StoreMgr = C.getStoreManager();
-    auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
-    if (!ViewVal)
-      return false;
-
-    // This should be a symbol that we saved in ViewMap if the view was
-    // created from a string. FIXME: Is includeBaseRegions=true needed?
-    SymbolRef View = ViewVal.getValue().getAsSymbol(true);
-    assert(View && "View is not a symbol!");
-    const MemRegion *String = innerptr::getStringFor(State, View);
-    if (!String)
-      return false;
-
-    // Step 2: Create or find an existing pointer symbol for this string
-    // and bind it to the call expression.
-    getPointerAndBindToCall(Call, String, C);
-    return true;
-  }
-
-  return false;
+  return (this->**Handler)(Call, C);
 }
 
 static bool isStringViewConversion(const CallEvent &Call) {
@@ -187,32 +212,94 @@ static bool isStringViewConversion(const CallEvent &Call) {
 
 void StringModeling::checkPostCall(const CallEvent &Call,
                                    CheckerContext &C) const {
-  if (!isStringViewConversion(Call))
+  if (isStringViewConversion(Call)) {
+    SymbolRef View = Call.getReturnValue().getAsSymbol();
+    if (!View)
+      return;
+
+    const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+    if (!ICall)
+      return;
+
+    const MemRegion *String = ICall->getCXXThisVal().getAsRegion();
+    if (!String)
+      return;
+
+    ProgramStateRef State = C.getState();
+
+    ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
+    const ViewSet *OldSet = State->get<ViewMap>(String);
+    ViewSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+    // FIXME: what does this ensure again?
+    assert(C.wasInlined || !NewSet.contains(View));
+    NewSet = F.add(NewSet, View);
+
+    C.addTransition(State->set<ViewMap>(String, NewSet));
     return;
+  }
 
-  SymbolRef View = Call.getReturnValue().getAsSymbol();
-  if (!View)
-    return;
+  if (const auto *CC = dyn_cast<CXXConstructorCall>(&Call)) {
+    const auto *CD = dyn_cast<CXXConstructorDecl>(Call.getDecl());
+    if (!CD || !CD->isCopyConstructor() || CD->getNumParams() != 1)
+      return;
 
-  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
-  if (!ICall)
-    return;
+    const CXXRecordDecl *RD = CD->getParent();
+    if (RD->getName() != "basic_string_view")
+      return;
 
-  const MemRegion *String = ICall->getCXXThisVal().getAsRegion();
-  if (!String)
-    return;
+    // FIXME: Is this part needed?
+    const Expr *Arg = Call.getArgExpr(0)->IgnoreImpCasts();
+    const auto *II = Arg->getType().getBaseTypeIdentifier();
+    if (!II || II->getName() != "basic_string_view")
+      return;
 
-  ProgramStateRef State = C.getState();
+    const MemRegion *CopiedRegion = CC->getArgSVal(0).getAsRegion();
+    if (!CopiedRegion)
+      return;
 
-  ViewSet::Factory &F = State->getStateManager().get_context<ViewSet>();
-  const ViewSet *OldSet = State->get<ViewMap>(String);
-  ViewSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+    ProgramStateRef State = C.getState();
+    StoreManager &StoreMgr = C.getStoreManager();
 
-  // FIXME: what does this ensure again?
-  assert(C.wasInlined || !NewSet.contains(View));
-  NewSet = F.add(NewSet, View);
+    auto CopiedVal = StoreMgr.getDefaultBinding(State->getStore(), CopiedRegion);
+    if (!CopiedVal)
+      return;
 
-  C.addTransition(State->set<ViewMap>(String, NewSet));
+    SymbolRef CopiedView = CopiedVal.getValue().getAsSymbol(true);
+    if (!CopiedView)
+      return;
+
+    // If CopiedView is tracked, this will return a string region.
+    // If it is not, it will return a nullptr and we exit.
+    const MemRegion *String = innerptr::getStringFor(State, CopiedView);
+    if (!String)
+      return;
+
+    const MemRegion *CreatedView = CC->getCXXThisVal().getAsRegion();
+    if (!CreatedView)
+      return;
+
+    CreatedView->dump();
+    llvm::errs() << "\n";
+
+    auto Def = StoreMgr.getDefaultBinding(State->getStore(), CreatedView);
+    if (!Def)
+      return;
+
+    Def.getValue().dump();
+    llvm::errs() << "\n";
+
+    SVal Val = StoreMgr.getBinding(State->getStore(), CC->getCXXThisVal().castAs<Loc>());
+    Val.dump();
+    llvm::errs() << "\n";
+
+    auto LCV = Val.castAs<nonloc::LazyCompoundVal>();
+    Store S = LCV.getStore();
+
+    SVal R = StoreMgr.getBinding(S, CC->getCXXThisVal().castAs<Loc>());
+    R.dump();
+    llvm::errs() << "\n";
+  }
 }
 
 void StringModeling::printState(raw_ostream &Out, ProgramStateRef State,

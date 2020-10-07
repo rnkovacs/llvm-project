@@ -111,7 +111,7 @@ public:
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
 
   void printState(raw_ostream &Out, ProgramStateRef State, const char *NL,
-                  const char *Sep) const;
+                  const char *Sep) const override;
 };
 
 } // end anonymous namespace
