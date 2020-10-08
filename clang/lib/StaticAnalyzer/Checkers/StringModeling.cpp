@@ -11,7 +11,6 @@
 // symbolic value for all c_str() or data() calls on the same string (default
 // behavior gives different symbols), making the analysis more precise.
 //
-// TODO: Support the construction of a view from a view.
 // TODO: Support the assignment of a string to a view.
 // TODO: Support the assignment of a view to a view.
 //
@@ -228,9 +227,6 @@ static bool isStringViewConversion(const CallEvent &Call) {
 }
 
 void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
-  // v |-> conj$6
-  // save:
-  // s |-> { v }
   if (SymbolRef Sym = Val.getAsSymbol(true)) {
     const MemRegion *String = innerptr::getStringForSymbol(C.getState(), Sym);
     if (!String)
@@ -288,17 +284,7 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     const auto *CD = dyn_cast<CXXConstructorDecl>(Call.getDecl());
     if (!CD || !CD->isCopyConstructor())
       return;
-/*
-    const CXXRecordDecl *RD = CD->getParent();
-    if (RD->getName() != "basic_string_view")
-      return;
 
-    // FIXME: Is this part needed?
-    const Expr *Arg = Call.getArgExpr(0)->IgnoreImpCasts();
-    const auto *II = Arg->getType().getBaseTypeIdentifier();
-    if (!II || II->getName() != "basic_string_view")
-      return;
-*/
     const MemRegion *CopiedView = CC->getArgSVal(0).getAsRegion();
     if (!CopiedView)
       return;
@@ -322,45 +308,6 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     NewSet = F.add(NewSet, CreatedView);
     C.addTransition(State->set<ViewRegions>(String, NewSet));
     return;
-
-/*
-    StoreManager &StoreMgr = C.getStoreManager();
-
-    auto CopiedVal = StoreMgr.getDefaultBinding(State->getStore(), CopiedRegion);
-    if (!CopiedVal)
-      return;
-
-    SymbolRef CopiedView = CopiedVal.getValue().getAsSymbol(true);
-    if (!CopiedView)
-      return;
-
-    // If CopiedView is tracked, this will return a string region.
-    // If it is not, it will return a nullptr and we exit.
-    const MemRegion *String = innerptr::getStringFor(State, CopiedView);
-    if (!String)
-      return;
-
-    CreatedView->dump();
-    llvm::errs() << "\n";
-
-    auto Def = StoreMgr.getDefaultBinding(State->getStore(), CreatedView);
-    if (!Def)
-      return;
-
-    Def.getValue().dump();
-    llvm::errs() << "\n";
-
-    SVal Val = StoreMgr.getBinding(State->getStore(), CC->getCXXThisVal().castAs<Loc>());
-    Val.dump();
-    llvm::errs() << "\n";
-
-    auto LCV = Val.castAs<nonloc::LazyCompoundVal>();
-    Store S = LCV.getStore();
-
-    SVal R = StoreMgr.getBinding(S, CC->getCXXThisVal().castAs<Loc>());
-    R.dump();
-    llvm::errs() << "\n";
-*/
   }
 }
 
