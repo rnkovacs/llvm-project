@@ -212,7 +212,7 @@ bool StringModeling::evalCall(const CallEvent &Call, CheckerContext &C) const {
 }
 
 static bool isStringViewConversion(const CallEvent &Call) {
-  const auto *CD = dyn_cast<CXXConversionDecl>(Call.getDecl());
+  const auto *CD = dyn_cast_or_null<CXXConversionDecl>(Call.getDecl());
   if (!CD || !CD->getParent())
     return false;
 
