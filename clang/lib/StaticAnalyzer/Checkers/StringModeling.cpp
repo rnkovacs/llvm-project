@@ -12,7 +12,7 @@
 // behavior gives different symbols), making the analysis more precise.
 //
 // TODO: Support the assignment of a string to a view.
-// TODO: Support the assignment of a view to a view.
+// TODO: Add notes to the view-view copy cases.
 //
 //===----------------------------------------------------------------------===//
 
@@ -75,7 +75,7 @@ public:
   ///   v |-> return symbol of s.operator string_view
   ///
   /// Result: s |-> { v }
-  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
 
   void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const;
   void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
@@ -226,7 +226,10 @@ static bool isStringViewConversion(const CallEvent &Call) {
   return true;
 }
 
-void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S,
+                               CheckerContext &C) const {
+  // Step 2: view is created from a string, end of construction.
+  // Associate the view with the string in ViewRegions.
   if (SymbolRef Sym = Val.getAsSymbol(true)) {
     const MemRegion *String = innerptr::getStringForSymbol(C.getState(), Sym);
     if (!String)
@@ -253,6 +256,10 @@ void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext
 
 void StringModeling::checkPostCall(const CallEvent &Call,
                                    CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // Step 1: view is created from a string, start of construction.
+  // Track the return symbol of the conversion operator call.
   if (isStringViewConversion(Call)) {
     SymbolRef View = Call.getReturnValue().getAsSymbol();
     if (!View)
@@ -266,8 +273,6 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     if (!String)
       return;
 
-    ProgramStateRef State = C.getState();
-
     SymbolSet::Factory &F = State->getStateManager().get_context<SymbolSet>();
     const SymbolSet *OldSet = State->get<CastSymbols>(String);
     SymbolSet NewSet = OldSet ? *OldSet : F.getEmptySet();
@@ -280,6 +285,8 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     return;
   }
 
+  // (Optional) Step 3: view is created from another view.
+  // Add the new view to the same ViewRegions entry the copied view is in.
   if (const auto *CC = dyn_cast<CXXConstructorCall>(&Call)) {
     const auto *CD = dyn_cast<CXXConstructorDecl>(Call.getDecl());
     if (!CD || !CD->isCopyConstructor())
@@ -289,7 +296,6 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     if (!CopiedView)
       return;
 
-    ProgramStateRef State = C.getState();
     const MemRegion *String = innerptr::getStringForRegion(State, CopiedView);
     if (!String)
       return;
@@ -299,6 +305,63 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     if (!CreatedView)
       return;
 
+    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+    const RegionSet *OldSet = State->get<ViewRegions>(String);
+    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+    // FIXME: what does this ensure again?
+    assert(C.wasInlined || !NewSet.contains(CreatedView));
+    NewSet = F.add(NewSet, CreatedView);
+    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    return;
+  }
+
+  if (const auto *MOC = dyn_cast<CXXMemberOperatorCall>(&Call)) {
+    if (MOC->getOverloadedOperator() != OO_Equal)
+      return;
+
+    // FIXME: Do I need an is-this-a-view check here?
+
+    SVal CopiedVal = State->getSVal(MOC->getArgExpr(0), C.getLocationContext());
+    const MemRegion *Copied = CopiedVal.getAsRegion();
+    if (!Copied)
+      return;
+
+    const MemRegion *CreatedView = MOC->getCXXThisVal().getAsRegion();
+    if (!CreatedView)
+      return;
+
+    if (const MemRegion *String = innerptr::getStringForRegion(State, Copied)) {
+      // The copied object is a view that we track!
+      // Add the newly created view to the ViewRegions map.
+      RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+      const RegionSet *OldSet = State->get<ViewRegions>(String);
+      RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+      // FIXME: what does this ensure again?
+      assert(C.wasInlined || !NewSet.contains(CreatedView));
+      NewSet = F.add(NewSet, CreatedView);
+      C.addTransition(State->set<ViewRegions>(String, NewSet));
+      return;
+    }
+
+    // The other possibility is that we call the assign op with a string.
+    // Look it up in the store and see if the symbol is among CastSymbols.
+    StoreManager &StoreMgr = C.getStoreManager();
+    auto SymOpt = StoreMgr.getDefaultBinding(State->getStore(), Copied);
+    if (!SymOpt)
+      return;
+
+    // FIXME: Still no idea what includebaseregions mean.
+    SymbolRef Sym = SymOpt.getValue().getAsSymbol(true);
+    if (!Sym)
+      return;
+
+    const MemRegion *String = innerptr::getStringForSymbol(State, Sym);
+    if (!String)
+      return;
+
+    // The symbol is among CastSymbols!
     RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
     const RegionSet *OldSet = State->get<ViewRegions>(String);
     RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
@@ -417,7 +480,8 @@ namespace clang {
 namespace ento {
 namespace innerptr {
 
-std::unique_ptr<BugReporterVisitor> getStringModelingBRVisitor(const MemRegion *Reg) {
+std::unique_ptr<BugReporterVisitor>
+getStringModelingBRVisitor(const MemRegion *Reg) {
   return std::make_unique<StringModeling::StringModelingBRVisitor>(Reg);
 }
 
@@ -432,7 +496,8 @@ const MemRegion *getStringForSymbol(ProgramStateRef State, SymbolRef Target) {
   return nullptr;
 }
 
-const MemRegion *getStringForRegion(ProgramStateRef State, const MemRegion *Target) {
+const MemRegion *getStringForRegion(ProgramStateRef State,
+                                    const MemRegion *Target) {
   ViewRegionsTy Map = State->get<ViewRegions>();
   for (const auto &Entry : Map) {
     for (const MemRegion *View : Entry.second) {
