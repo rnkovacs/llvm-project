@@ -556,14 +556,14 @@ def StringModeling : Checker<"StringModeling">,
   Documentation<NotDocumented>,
   Hidden;
 
-def StringViewChecker : Checker<"StringView">,
-  HelpText<"FIXME">,
-  Documentation<NotDocumented>;
-
 def InnerPointerChecker : Checker<"InnerPointer">,
   HelpText<"Check for inner pointers of C++ containers used after "
            "re/deallocation">,
   Dependencies<[DynamicMemoryModeling, StringModeling]>,
+  Documentation<NotDocumented>;
+
+def StringViewChecker : Checker<"StringView">,
+  HelpText<"FIXME">,
   Documentation<NotDocumented>;
 
 def NewDeleteChecker : Checker<"NewDelete">,
