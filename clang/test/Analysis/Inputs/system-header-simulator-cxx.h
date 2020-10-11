@@ -563,6 +563,34 @@ namespace std {
   };
 
   template <typename CharT>
+  class basic_string_view {
+  public:
+    basic_string_view();
+    basic_string_view(const basic_string_view &other);
+
+    ~basic_string_view();
+    basic_string_view &operator=(const basic_string_view &view);
+
+    const CharT &operator[](size_type pos) const;
+    const CharT &at(size_type pos) const;
+    const CharT &front() const;
+    const CharT *data() const;
+
+    void remove_prefix(size_type n);
+    void swap(basic_string_view &v);
+
+    size_type copy(CharT *fest, size_type count, size_type pos = 0) const;
+    int compare(basic_string_view v) const;
+  };
+
+  typedef basic_string_view<char> string_view;
+  typedef basic_string_view<wchar_t> wstring_view;
+#if __cplusplus >= 201103L
+  typedef basic_string_view<char16_t> u16string_view;
+  typedef basic_string_view<char32_t> u32string_view;
+#endif
+
+  template <typename CharT>
   class basic_string {
   public:
     basic_string();
@@ -577,6 +605,8 @@ namespace std {
     const CharT *c_str() const;
     const CharT *data() const;
     CharT *data();
+
+    operator basic_string_view<CharT>() const;
 
     basic_string &append(size_type count, CharT ch);
     basic_string &assign(size_type count, CharT ch);

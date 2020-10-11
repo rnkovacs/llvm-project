@@ -80,7 +80,7 @@ void derefOnSwappedNullPtr() {
 void derefOnStdSwappedNullPtr() {
   std::unique_ptr<A> P; // expected-note {{Default constructed smart pointer 'P' is null}}
   std::unique_ptr<A> PNull; // expected-note {{Default constructed smart pointer 'PNull' is null}}
-  std::swap(P, PNull); // expected-note@Inputs/system-header-simulator-cxx.h:979 {{Swapped null smart pointer 'PNull' with smart pointer 'P'}}
+  std::swap(P, PNull); // expected-note@Inputs/system-header-simulator-cxx.h:1009 {{Swapped null smart pointer 'PNull' with smart pointer 'P'}}
   // expected-note@-1 {{Calling 'swap<A>'}}
   // expected-note@-2 {{Returning from 'swap<A>'}}
   P->foo(); // expected-warning {{Dereference of null smart pointer 'P' [alpha.cplusplus.SmartPtr]}}
