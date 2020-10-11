@@ -144,12 +144,6 @@ void StringViewChecker::checkLocation(SVal V, bool isLoad, const Stmt *S,
     if (C.getState()->contains<ReleasedViews>(Region))
       reportUseAfterFree(C, Region);
   }
-  /*
-  if (auto Sym = V.getAs<nonloc::SymbolVal>()) {
-    SymbolRef View = Sym->getSymbol();
-    if (C.getState()->contains<ReleasedViews>(View))
-      reportUseAfterFree(C, View);
-  }*/
 }
 
 void StringViewChecker::checkPreStmt(const ReturnStmt *S,
@@ -164,22 +158,38 @@ void StringViewChecker::checkEndFunction(const ReturnStmt *S,
 
 void StringViewChecker::checkEscapeOnReturn(const ReturnStmt *S,
                                             CheckerContext &C) const {
-  /*
-  if (!S)
+  if (!S || !S->getRetValue())
     return;
 
-  const Expr *RetExpr = S->getRetValue();
-  if (!RetExpr)
+  const auto *CE = dyn_cast<CXXConstructExpr>(S->getRetValue());
+  if (!CE)
     return;
 
-  SVal RetVal = C.getSVal(RetExpr);
+  CXXConstructorDecl *CDecl = CE->getConstructor();
+  if (!CDecl || !CDecl->isCopyConstructor())
+    return;
 
-  if (auto Sym = RetVal.getAs<nonloc::SymbolVal>()) {
-    SymbolRef View = Sym->getSymbol();
-    if (C.getState()->contains<ReleasedViews>(View)) {
-      reportUseAfterFree(C, View);
-    }
-  }*/
+  const auto *II = CDecl->getThisObjectType().getBaseTypeIdentifier();
+  if (!II || II->getName() != "basic_string_view")
+    return;
+
+  const auto *Copied = dyn_cast<DeclRefExpr>(CE->getArg(0)->IgnoreImpCasts());
+  if (!Copied)
+    return;
+
+  const auto *ViewDecl = dyn_cast_or_null<VarDecl>(Copied->getDecl());
+  if (!ViewDecl)
+    return;
+
+  ProgramStateRef State = C.getState();
+  const LocationContext *LC = C.getLocationContext();
+
+  const auto *CopiedView = State->getLValue(ViewDecl, LC).getAsRegion();
+  if (!CopiedView)
+    return;
+
+  if (State->contains<ReleasedViews>(CopiedView))
+    reportUseAfterFree(C, CopiedView);
 }
 
 void StringViewChecker::checkPreCall(const CallEvent &Call,
@@ -207,24 +217,13 @@ void StringViewChecker::checkUse(const CXXInstanceCall *Call,
   if (!View)
     return;
 
-  ProgramStateRef State = C.getState();
-
-  /*
-  StoreManager &StoreMgr = C.getStoreManager();
-
-  auto ViewVal = StoreMgr.getDefaultBinding(State->getStore(), ViewRegion);
-  if (!ViewVal)
-    return;
-
-  SymbolRef View = ViewVal.getValue().getAsSymbol(true);
-  */
-  if (State->contains<ReleasedViews>(View)) {
+  if (C.getState()->contains<ReleasedViews>(View))
     reportUseAfterFree(C, View);
-  }
 }
 
 void StringViewChecker::checkDeadSymbols(SymbolReaper &SymReaper,
                                          CheckerContext &C) const {
+  /*
   ProgramStateRef State = C.getState();
   const ReleasedViewsTy &Set = State->get<ReleasedViews>();
 
@@ -234,6 +233,7 @@ void StringViewChecker::checkDeadSymbols(SymbolReaper &SymReaper,
   }
 
   C.addTransition(State);
+  */
 }
 
 ProgramStateRef StringViewChecker::checkPointerEscape(
