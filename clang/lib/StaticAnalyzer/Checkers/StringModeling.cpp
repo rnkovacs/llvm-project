@@ -11,8 +11,7 @@
 // symbolic value for all c_str() or data() calls on the same string (default
 // behavior gives different symbols), making the analysis more precise.
 //
-// TODO: Support the assignment of a string to a view.
-// TODO: Add notes to the view-view copy cases.
+// TODO: Add/modify notes.
 //
 //===----------------------------------------------------------------------===//
 
@@ -43,6 +42,8 @@ class StringModeling : public Checker<eval::Call, check::PostCall, check::Bind,
   using HandlerFn = bool (StringModeling::*)(const CallEvent &,
                                              CheckerContext &) const;
 
+  CallDescription ViewSubstr;
+
   CallDescriptionMap<HandlerFn> StringHandlers{
       {{{"std", "basic_string", "c_str"}},
        &StringModeling::handleStringCStrData},
@@ -55,6 +56,8 @@ class StringModeling : public Checker<eval::Call, check::PostCall, check::Bind,
   bool handleViewData(const CallEvent &Call, CheckerContext &C) const;
 
 public:
+  StringModeling() : ViewSubstr({"std", "basic_string_view", "substr"}) {}
+
   /// Create a unique symbol for the buffer pointer of a string. Use this
   /// symbol as a result for all the relevant methods in StringHandlers.
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
@@ -284,6 +287,38 @@ void StringModeling::checkPostCall(const CallEvent &Call,
     C.addTransition(State->set<CastSymbols>(String, NewSet));
     return;
   }
+
+  if (Call.isCalled(ViewSubstr)) {
+    const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+    const MemRegion *Source = ICall->getCXXThisVal().getAsRegion();
+    if (!Source)
+      return;
+
+    // If the source of the substr() call is in the ViewRegions map,
+    // associate the new view with the same string.
+    const MemRegion *String = innerptr::getStringForRegion(C.getState(), Source);
+    if (!String)
+      return;
+
+    auto ViewObj = Call.getReturnValue().getAs<nonloc::LazyCompoundVal>();
+    if (!ViewObj)
+      return;
+
+    const MemRegion *CreatedView = ViewObj.getValue().getRegion();
+    if (!CreatedView)
+      return;
+
+    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+    const RegionSet *OldSet = State->get<ViewRegions>(String);
+    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+    // FIXME: what does this ensure again?
+    assert(C.wasInlined || !NewSet.contains(CreatedView));
+    NewSet = F.add(NewSet, CreatedView);
+    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    return;
+  }
+
 
   // (Optional) Step 3: view is created from another view.
   // Add the new view to the same ViewRegions entry the copied view is in.

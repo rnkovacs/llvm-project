@@ -564,22 +564,22 @@ namespace std {
 
   template <typename CharT>
   class basic_string_view {
+    static size_type npos;
+
   public:
     basic_string_view();
-    basic_string_view(const basic_string_view &other);
-
+    basic_string_view(const basic_string_view &other) = default;
     ~basic_string_view();
     basic_string_view &operator=(const basic_string_view &view);
 
     const CharT &operator[](size_type pos) const;
     const CharT &at(size_type pos) const;
-    const CharT &front() const;
-    const CharT *data() const;
 
+    const CharT *data() const;
     void remove_prefix(size_type n);
     void swap(basic_string_view &v);
-
-    size_type copy(CharT *fest, size_type count, size_type pos = 0) const;
+    basic_string_view substr(size_type pos = 0, size_type count = npos) const {
+      return basic_string_view(data() + pos, count); }
     int compare(basic_string_view v) const;
   };
 
