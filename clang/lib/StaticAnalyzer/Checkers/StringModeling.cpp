@@ -55,6 +55,13 @@ class StringModeling : public Checker<eval::Call, check::PostCall, check::Bind,
   bool handleStringCStrData(const CallEvent &Call, CheckerContext &C) const;
   bool handleViewData(const CallEvent &Call, CheckerContext &C) const;
 
+  void handleStringViewConversion(const CallEvent &Call,
+                                  CheckerContext &C) const;
+  void handleConstructionFromView(const CXXConstructorCall *CC,
+                                  CheckerContext &C) const;
+  void handleViewSubstr(const CallEvent &Call, CheckerContext &C) const;
+  void handleAssignOp(const CXXMemberOperatorCall *MOC, CheckerContext &C) const;
+
 public:
   StringModeling() : ViewSubstr({"std", "basic_string_view", "substr"}) {}
 
@@ -229,182 +236,188 @@ static bool isStringViewConversion(const CallEvent &Call) {
   return true;
 }
 
+static ProgramStateRef getStateWithView(ProgramStateRef State,
+                                        const MemRegion *String,
+                                        const MemRegion *View) {
+  RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
+  const RegionSet *OldSet = State->get<ViewRegions>(String);
+  RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+  // FIXME: what does this ensure again?
+  // assert(C.wasInlined || !NewSet.contains(View));
+  NewSet = F.add(NewSet, View);
+
+  return State->set<ViewRegions>(String, NewSet);
+}
+
+static ProgramStateRef getStateWithCastSymbol(ProgramStateRef State,
+                                              const MemRegion *String,
+                                              SymbolRef View) {
+  SymbolSet::Factory &F = State->getStateManager().get_context<SymbolSet>();
+  const SymbolSet *OldSet = State->get<CastSymbols>(String);
+  SymbolSet NewSet = OldSet ? *OldSet : F.getEmptySet();
+
+  // FIXME: what does this ensure again?
+  // assert(C.wasInlined || !NewSet.contains(View));
+  NewSet = F.add(NewSet, View);
+
+  return State->set<CastSymbols>(String, NewSet);
+}
+
 void StringModeling::checkBind(SVal Loc, SVal Val, const Stmt *S,
                                CheckerContext &C) const {
-  // Step 2: view is created from a string, end of construction.
-  // Associate the view with the string in ViewRegions.
+  // Copy constructor with a string argument 2/2.
+  // The cast symbol is bound to the view.
+  // We look up the string and associate it with the view.
   if (SymbolRef Sym = Val.getAsSymbol(true)) {
     const MemRegion *String = innerptr::getStringForSymbol(C.getState(), Sym);
     if (!String)
       return;
 
-    // The symbol is in the CastSymbols map.
-    // Add (String, Loc) to the ViewRegions map.
     ProgramStateRef State = C.getState();
     const MemRegion *View = Loc.getAsRegion();
     if (!View)
       return;
 
-    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
-    const RegionSet *OldSet = State->get<ViewRegions>(String);
-    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-    // FIXME: what does this ensure again?
-    assert(C.wasInlined || !NewSet.contains(View));
-    NewSet = F.add(NewSet, View);
-    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    C.addTransition(getStateWithView(State, String, View));
     return;
   }
 }
 
-void StringModeling::checkPostCall(const CallEvent &Call,
-                                   CheckerContext &C) const {
+void StringModeling::handleStringViewConversion(const CallEvent &Call,
+                                                CheckerContext &C) const {
+  SymbolRef View = Call.getReturnValue().getAsSymbol();
+  if (!View)
+    return;
+
+  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+  if (!ICall)
+    return;
+
+  const MemRegion *String = ICall->getCXXThisVal().getAsRegion();
+  if (!String)
+    return;
+
+  C.addTransition(getStateWithCastSymbol(C.getState(), String, View));
+  return;
+}
+
+void StringModeling::handleConstructionFromView(const CXXConstructorCall *CC,
+                                                CheckerContext &C) const {
+  const auto *CD = dyn_cast<CXXConstructorDecl>(CC->getDecl());
+  if (!CD || !CD->isCopyConstructor())
+    return;
+
+  const MemRegion *CopiedView = CC->getArgSVal(0).getAsRegion();
+  if (!CopiedView)
+    return;
+
+  const MemRegion *String =
+      innerptr::getStringForRegion(C.getState(), CopiedView);
+  if (!String)
+    return;
+
+  const MemRegion *CreatedView = CC->getCXXThisVal().getAsRegion();
+  if (!CreatedView)
+    return;
+
+  C.addTransition(getStateWithView(C.getState(), String, CreatedView));
+  return;
+}
+
+void StringModeling::handleViewSubstr(const CallEvent &Call,
+                                      CheckerContext &C) const {
+  const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
+  const MemRegion *Source = ICall->getCXXThisVal().getAsRegion();
+  if (!Source)
+    return;
+
+  const MemRegion *String = innerptr::getStringForRegion(C.getState(), Source);
+  if (!String)
+    return;
+
+  auto ViewObj = Call.getReturnValue().getAs<nonloc::LazyCompoundVal>();
+  if (!ViewObj)
+    return;
+
+  const MemRegion *CreatedView = ViewObj.getValue().getRegion();
+  if (!CreatedView)
+    return;
+
+  C.addTransition(getStateWithView(C.getState(), String, CreatedView));
+  return;
+}
+
+void StringModeling::handleAssignOp(const CXXMemberOperatorCall *MOC,
+                                    CheckerContext &C) const {
   ProgramStateRef State = C.getState();
 
-  // Step 1: view is created from a string, start of construction.
-  // Track the return symbol of the conversion operator call.
+  SVal CopiedVal = State->getSVal(MOC->getArgExpr(0), C.getLocationContext());
+  const MemRegion *Copied = CopiedVal.getAsRegion();
+  if (!Copied)
+    return;
+
+  const MemRegion *View = MOC->getCXXThisVal().getAsRegion();
+  if (!View)
+    return;
+
+  if (const MemRegion *String = innerptr::getStringForRegion(State, Copied)) {
+    // The copied object is a view that we track!
+    // Add the newly created view to the ViewRegions map.
+    C.addTransition(getStateWithView(State, String, View));
+    return;
+  }
+
+  // The other possibility is that we call the assign op with a string.
+  // Look it up in the store and see if the symbol is among CastSymbols.
+  StoreManager &StoreMgr = C.getStoreManager();
+  auto SymOpt = StoreMgr.getDefaultBinding(State->getStore(), Copied);
+  if (!SymOpt)
+    return;
+
+  // FIXME: Still no idea what includebaseregions mean.
+  SymbolRef Sym = SymOpt.getValue().getAsSymbol(true);
+  if (!Sym)
+    return;
+
+  const MemRegion *String = innerptr::getStringForSymbol(State, Sym);
+  if (!String)
+    return;
+
+  // The symbol is among CastSymbols!
+  C.addTransition(getStateWithView(State, String, View));
+  return;
+}
+
+void StringModeling::checkPostCall(const CallEvent &Call,
+                                   CheckerContext &C) const {
+  // Copy constructor with a string argument 1/2.
+  // We save the string and the result symbol of the cast expr.
+  // For 2/2, see checkBind.
   if (isStringViewConversion(Call)) {
-    SymbolRef View = Call.getReturnValue().getAsSymbol();
-    if (!View)
-      return;
-
-    const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
-    if (!ICall)
-      return;
-
-    const MemRegion *String = ICall->getCXXThisVal().getAsRegion();
-    if (!String)
-      return;
-
-    SymbolSet::Factory &F = State->getStateManager().get_context<SymbolSet>();
-    const SymbolSet *OldSet = State->get<CastSymbols>(String);
-    SymbolSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-    // FIXME: what does this ensure again?
-    assert(C.wasInlined || !NewSet.contains(View));
-    NewSet = F.add(NewSet, View);
-
-    C.addTransition(State->set<CastSymbols>(String, NewSet));
+    handleStringViewConversion(Call, C);
     return;
   }
 
+  // Copy constructor with a view argument.
+  if (const auto *ConstructorCall = dyn_cast<CXXConstructorCall>(&Call)) {
+    handleConstructionFromView(ConstructorCall, C);
+    return;
+  }
+
+  // substr() creates a new view from an existing view.
   if (Call.isCalled(ViewSubstr)) {
-    const auto *ICall = dyn_cast<CXXInstanceCall>(&Call);
-    const MemRegion *Source = ICall->getCXXThisVal().getAsRegion();
-    if (!Source)
-      return;
-
-    // If the source of the substr() call is in the ViewRegions map,
-    // associate the new view with the same string.
-    const MemRegion *String = innerptr::getStringForRegion(C.getState(), Source);
-    if (!String)
-      return;
-
-    auto ViewObj = Call.getReturnValue().getAs<nonloc::LazyCompoundVal>();
-    if (!ViewObj)
-      return;
-
-    const MemRegion *CreatedView = ViewObj.getValue().getRegion();
-    if (!CreatedView)
-      return;
-
-    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
-    const RegionSet *OldSet = State->get<ViewRegions>(String);
-    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-    // FIXME: what does this ensure again?
-    assert(C.wasInlined || !NewSet.contains(CreatedView));
-    NewSet = F.add(NewSet, CreatedView);
-    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    handleViewSubstr(Call, C);
     return;
   }
 
-
-  // (Optional) Step 3: view is created from another view.
-  // Add the new view to the same ViewRegions entry the copied view is in.
-  if (const auto *CC = dyn_cast<CXXConstructorCall>(&Call)) {
-    const auto *CD = dyn_cast<CXXConstructorDecl>(Call.getDecl());
-    if (!CD || !CD->isCopyConstructor())
-      return;
-
-    const MemRegion *CopiedView = CC->getArgSVal(0).getAsRegion();
-    if (!CopiedView)
-      return;
-
-    const MemRegion *String = innerptr::getStringForRegion(State, CopiedView);
-    if (!String)
-      return;
-
-    // CopiedView is in ViewRegions.
-    const MemRegion *CreatedView = CC->getCXXThisVal().getAsRegion();
-    if (!CreatedView)
-      return;
-
-    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
-    const RegionSet *OldSet = State->get<ViewRegions>(String);
-    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-    // FIXME: what does this ensure again?
-    assert(C.wasInlined || !NewSet.contains(CreatedView));
-    NewSet = F.add(NewSet, CreatedView);
-    C.addTransition(State->set<ViewRegions>(String, NewSet));
-    return;
-  }
-
+  // The copy assignment operator associates the view with a new string,
+  // either directly or through another view.
   if (const auto *MOC = dyn_cast<CXXMemberOperatorCall>(&Call)) {
     if (MOC->getOverloadedOperator() != OO_Equal)
       return;
 
-    // FIXME: Do I need an is-this-a-view check here?
-
-    SVal CopiedVal = State->getSVal(MOC->getArgExpr(0), C.getLocationContext());
-    const MemRegion *Copied = CopiedVal.getAsRegion();
-    if (!Copied)
-      return;
-
-    const MemRegion *CreatedView = MOC->getCXXThisVal().getAsRegion();
-    if (!CreatedView)
-      return;
-
-    if (const MemRegion *String = innerptr::getStringForRegion(State, Copied)) {
-      // The copied object is a view that we track!
-      // Add the newly created view to the ViewRegions map.
-      RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
-      const RegionSet *OldSet = State->get<ViewRegions>(String);
-      RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-      // FIXME: what does this ensure again?
-      assert(C.wasInlined || !NewSet.contains(CreatedView));
-      NewSet = F.add(NewSet, CreatedView);
-      C.addTransition(State->set<ViewRegions>(String, NewSet));
-      return;
-    }
-
-    // The other possibility is that we call the assign op with a string.
-    // Look it up in the store and see if the symbol is among CastSymbols.
-    StoreManager &StoreMgr = C.getStoreManager();
-    auto SymOpt = StoreMgr.getDefaultBinding(State->getStore(), Copied);
-    if (!SymOpt)
-      return;
-
-    // FIXME: Still no idea what includebaseregions mean.
-    SymbolRef Sym = SymOpt.getValue().getAsSymbol(true);
-    if (!Sym)
-      return;
-
-    const MemRegion *String = innerptr::getStringForSymbol(State, Sym);
-    if (!String)
-      return;
-
-    // The symbol is among CastSymbols!
-    RegionSet::Factory &F = State->getStateManager().get_context<RegionSet>();
-    const RegionSet *OldSet = State->get<ViewRegions>(String);
-    RegionSet NewSet = OldSet ? *OldSet : F.getEmptySet();
-
-    // FIXME: what does this ensure again?
-    assert(C.wasInlined || !NewSet.contains(CreatedView));
-    NewSet = F.add(NewSet, CreatedView);
-    C.addTransition(State->set<ViewRegions>(String, NewSet));
+    handleAssignOp(MOC, C);
     return;
   }
 }
