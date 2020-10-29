@@ -4,8 +4,6 @@
 
 #include "Inputs/system-header-simulator-cxx.h"
 
-std::basic_string_view::npos = size_type(-1);
-/*
 char CopyCtorUseAfterClear() {
   std::string S("abc");
   std::string_view V(S);
@@ -43,14 +41,5 @@ std::string_view ReturnView() {
   std::string_view V(S); // expected-note {{Pointer to inner buffer of 'std::string' obtained here}}
   S.clear(); // expected-note {{Inner buffer of 'std::string' reallocated by call to 'clear'}}
   return V; // expected-warning {{Inner pointer of container used after re/deallocation}}
-  // expected-note@-1 {{Inner pointer of container used after re/deallocation}}
-}
-*/
-void ViewSubstr() {
-  std::string S("abc");
-  std::string_view V(S);
-  std::string_view W = V.substr(1, 2); // expected-note {{Pointer to inner buffer of 'std::string' obtained here}}
-  S.clear(); // expected-note {{Inner buffer of 'std::string' reallocated by call to 'clear'}}
-  W.remove_prefix(1); // expected-warning {{Inner pointer of container used after re/deallocation}}
   // expected-note@-1 {{Inner pointer of container used after re/deallocation}}
 }
